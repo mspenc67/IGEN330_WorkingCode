@@ -72,11 +72,11 @@ def get_direction_descriptor(cx: int, cy: int, frame_w: int, frame_h: int) -> st
     third_h = frame_h / 3.0
 
     if cx < third_w:
-        horiz = "right"
+        horiz = "left"
     elif cx < 2 * third_w:
         horiz = "center"
     else:
-        horiz = "left"
+        horiz = "right"
 
     if cy < third_h:
         vert = "upper"
@@ -136,17 +136,18 @@ except Exception as e:
     sensor = None
 
 OBSTACLE_CLASSES = [
-    "person", "bicycle", "car", "chair", "bench", "truck", "traffic light",
-    "fire hydrant", "stop sign", "stairs","phone","scooter","motorcycle",
-    "tree","bushes","cup","cups","bowl"  # stairs requires custom model later
+    "bicycle", "car", "motorcycle", "bus", "train", "truck", "boat",
+    "traffic light", "fire hydrant", "stop sign", "parking meter",
+    "person","knife","chair","laptop","cell phone","remote","keyboard","mouse"
+      # stairs requires custom model later
 ]
 
-neg_OBSTACLE_CLASSES = [ #filtering OUT rather than filtering IN
+neg_OBSTACLE_CLASSES = [ #filtering OUT rather than filtering IN,
     "person"
 ]
 
 # Distance threshold for considering something "close" (in mm)
-CLOSE_THRESHOLD_MM = 600
+CLOSE_THRESHOLD_MM = 1000
 
 # How often we remind the user about the same object
 ALERT_REMINDER_SECONDS = 1.0  # reduced from 5.0 for faster re-alerting
@@ -445,6 +446,7 @@ def check_sensor_close_in_region(sensor_data, sensor_cells, distance_threshold=4
 excel_filename = f"detection_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
 wb = None
 ws = None
+ws_close = None  # second sheet: confirmed-close detections only
 if _has_openpyxl:
     wb = Workbook()
     ws = wb.active
@@ -487,6 +489,27 @@ if _has_openpyxl:
     ws.column_dimensions['I'].width = 18  # Frame average conf
     ws.column_dimensions['J'].width = 15  # Frame close count
     ws.column_dimensions['K'].width = 40  # Frame close objects
+
+    # ── Second sheet: one row per confirmed-close detection event ──────────────
+    ws_close = wb.create_sheet(title="Close Detections")
+    close_headers = [
+        "Timestamp",
+        "Object Class",
+        "Sensor Distance (mm)",
+        "YOLO Confidence",
+    ]
+    ws_close.append(close_headers)
+
+    close_header_fill = PatternFill(start_color="C00000", end_color="C00000", fill_type="solid")
+    for cell in ws_close[1]:
+        cell.fill = close_header_fill
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    ws_close.column_dimensions['A'].width = 25  # Timestamp
+    ws_close.column_dimensions['B'].width = 18  # Object class
+    ws_close.column_dimensions['C'].width = 22  # Sensor distance
+    ws_close.column_dimensions['D'].width = 18  # YOLO confidence
 
 # Tracking for 0.25 second interval data logging
 last_log_time = time.time()
@@ -552,7 +575,7 @@ while True:
 
             label = model.names[cls]
             #if label in OBSTACLE_CLASSES and conf > 0.4:
-            if label not in neg_OBSTACLE_CLASSES:
+            if label in OBSTACLE_CLASSES:
                 location_str = f"({center_x}, {center_y})"
                 
                 # Map the full bounding box to sensor grid cells, then keep only
@@ -593,6 +616,7 @@ while True:
                     'confidence': conf,
                     'location': location_str,
                     'sensor_close': sensor_close,
+                    'sensor_close_confirmed': sensor_close_confirmed,
                     'sensor_distance': sensor_distance,
                     'sensor_cells': sensor_cells,
                     'closest_cell': closest_cell
@@ -650,12 +674,12 @@ while True:
                     unidentifiable_close = True
                     if min_unidentified_dist is None or dist < min_unidentified_dist:
                         min_unidentified_dist = dist
-
-    if unidentifiable_close:
+    #UNIDENTIFIABLE OBJECT CHECK DISABLED
+    #if unidentifiable_close:
         #print(f"ALERT: unidentifiable object detected at ~{min_unidentified_dist}mm (sensor, no YOLO match)")
-        if not audio_alert_sent:
-            speak_text("Alert: unidentifiable object detected")
-            audio_alert_sent = True
+        #if not audio_alert_sent:
+            #speak_text("Alert: unidentifiable object detected")
+            #audio_alert_sent = True
 
     # Advance the close-cell history for the next frame's confirmation check
     prev_close_cells = current_close_cells
@@ -691,7 +715,7 @@ while True:
                 frame_close_count = 0
                 frame_close_list = ""
             
-            # add one row per detection
+            # add one row per detection (main sheet)
             for d in current_frame_detections:
                 cells_str = ", ".join([f"({r},{c})" for r, c in d['sensor_cells']]) if d['sensor_cells'] else ""
                 is_close_str = "Y" if d['sensor_close'] else ""
@@ -709,6 +733,18 @@ while True:
                     frame_close_count,
                     frame_close_list
                 ])
+
+            # "Close Detections" sheet — one row per confirmed-close event only
+            if ws_close is not None:
+                for d in current_frame_detections:
+                    if d.get('sensor_close_confirmed') and d['sensor_distance'] is not None:
+                        ws_close.append([
+                            timestamp,
+                            d['label'],
+                            d['sensor_distance'],
+                            round(d['confidence'], 2),
+                        ])
+
             wb.save(excel_filename)
             last_log_time = current_time
     
