@@ -2,7 +2,6 @@ from ultralytics import YOLO
 import cv2
 import time
 import threading
-from collections import deque
 
 import numpy as np
 import subprocess
@@ -53,6 +52,7 @@ def speak_text(text: str) -> None:
                 "Add-Type -AssemblyName System.Speech; "
                 "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
                 f"$s.SelectVoice('{VOICE_NAME}'); "
+                "$s.Rate = 2; "          # -10 (slowest) to 10 (fastest); 4 = noticeably faster
                 f"$s.Speak('{safe_text}');"
             )
         ]
@@ -149,7 +149,7 @@ neg_OBSTACLE_CLASSES = [ #filtering OUT rather than filtering IN
 CLOSE_THRESHOLD_MM = 600
 
 # How often we remind the user about the same object
-ALERT_REMINDER_SECONDS = 5.0
+ALERT_REMINDER_SECONDS = 1.0  # reduced from 5.0 for faster re-alerting
 
 # If an object stays in roughly the same place, we consider it "the same object".
 TRACKED_OBJECT_MOVE_THRESHOLD_PX = 80  # pixels for center movement
@@ -158,44 +158,103 @@ TRACKED_OBJECT_MAX_AGE = 10.0  # seconds before forgetting a tracked object
 # Tracking objects over time so we can re-alert only after a reminder interval
 tracked_objects = []  # each entry: {label, center, last_alert, last_seen}
 
-# Grid visualization parameters
-GRID_WIDTH = 800
-GRID_HEIGHT = 600
-GRID_CELL_SIZE = 50  # Size of each grid square
-GRID_COLOR = (50, 50, 50)  # Dark gray for grid lines
-TEXT_COLOR = (0, 255, 0)  # Green text
-BOX_COLOR = (0, 255, 0)  # Green boxes
+# Sensor cells that were below CLOSE_THRESHOLD_MM in the most recent frame.
+# A reading is only treated as real if it appears in TWO consecutive frames,
+# which eliminates single-frame sensor spikes without altering displayed values.
+prev_close_cells: set = set()
 
 # Sensor grid visualization parameters
+GRID_COLOR = (50, 50, 50)   # Dark gray for grid lines (used in sensor grid)
 SENSOR_GRID_SIZE = 600  # Size of sensor grid window (square)
 SENSOR_CELL_SIZE = SENSOR_GRID_SIZE // 8  # Each cell is 1/8 of the grid
-SENSOR_MAX_DISTANCE = 4000  # Maximum distance in mm for color scaling (VL53L5CX max ~4m)
-SENSOR_VOID_VALUE = SENSOR_MAX_DISTANCE  # Used for "no data" / invalid readings (treat as far)
+SENSOR_MAX_DISTANCE = 3500  # Sensor reliable range ceiling in mm (used for colour scaling only)
+SENSOR_VOID_VALUE = 0       # Sensor outputs 0 for invalid / out-of-range readings
 SENSOR_STALE_TIMEOUT = 0.5  # seconds before we treat the data as stale
-SENSOR_SMOOTHING_FRAMES = 2  # temporal smoothing window
 
-# Store last sensor data to retain visualization (smoothed)
-# (actual data is updated from the background polling thread)
+# Shared state between the main loop and the sensor polling thread
 last_sensor_print_time = 0.0
 sensor_warning_printed = False
 sensor_parse_warning_printed = False
-
-# History used for temporal smoothing (median filter)
-sensor_history = deque(maxlen=SENSOR_SMOOTHING_FRAMES)
-
-# Shared state between the main loop and the sensor polling thread
 sensor_data_lock = threading.Lock()
-last_sensor_data = np.full((8, 8), SENSOR_MAX_DISTANCE, dtype=np.int32)
+last_sensor_data = np.zeros((8, 8), dtype=np.int32)  # 0 = no data yet (matches sensor invalid value)
 last_sensor_update_time = time.time()
 
 # Thread stop signal (clean shutdown)
 sensor_stop_event = threading.Event()
+
+
+def _normalize_sensor_data(raw_sensor_data):
+    """Normalize sensor data into an 8x8 numpy int32 array.
+
+    Supports:
+    - numpy arrays (1D length 64 or 2D 8x8)
+    - list/tuple data (flat or nested)
+    - dicts with keys like 'distances', 'data', or a single-value mapping
+
+    Returns None when the input cannot be interpreted.
+    """
+    if raw_sensor_data is None:
+        return None
+
+    # Unwrap common dict wrappers
+    if isinstance(raw_sensor_data, dict):
+        for key in ("distances", "distance_mm", "ranging_data", "data", "grid", "frame"):
+            if key in raw_sensor_data:
+                return _normalize_sensor_data(raw_sensor_data[key])
+        # If dict contains a single entry, try that value
+        if len(raw_sensor_data) == 1:
+            return _normalize_sensor_data(next(iter(raw_sensor_data.values())))
+        return None
+
+    # Convert to numpy array where possible
+    try:
+        arr = np.asarray(raw_sensor_data)
+    except Exception:
+        return None
+
+    # If the data is already 8x8, we're good.
+    if arr.shape == (8, 8):
+        return arr.astype(np.int32, copy=False)
+
+    # If it's 1D with 64 values, reshape to 8x8
+    if arr.ndim == 1 and arr.size == 64:
+        try:
+            return arr.reshape((8, 8)).astype(np.int32, copy=False)
+        except Exception:
+            pass
+
+    # If total entries == 64, try reshaping regardless of dims
+    if arr.size == 64:
+        try:
+            return arr.reshape((8, 8)).astype(np.int32, copy=False)
+        except Exception:
+            pass
+
+    # As a fallback, flatten and pad/truncate to 64 values.
+    flat = arr.flatten()
+    if flat.size < 64:
+        # Pad with 0 (sensor's own invalid marker) — do NOT substitute a synthetic distance
+        pad = np.zeros(64 - flat.size, dtype=np.int32)
+        flat = np.concatenate([flat, pad])
+    elif flat.size > 64:
+        flat = flat[:64]
+
+    # Ensure integer values; replace any non-finite floats with 0 (invalid marker)
+    try:
+        flat = flat.astype(np.int32, copy=False)
+    except Exception:
+        flat = np.array(flat, dtype=np.int32)
+
+    flat = np.where(np.isfinite(flat.astype(float)), flat, 0).astype(np.int32)
+    return flat.reshape((8, 8))
+
 
 def _sensor_polling_thread():
     """Continuously poll the VL53L5CX sensor in a background thread.
 
     This decouples sensor I/O from the camera/YOLO loop so the camera stays smooth
     even if serial reads are slow or intermittent.
+    Raw sensor values are written directly — no smoothing or value substitution.
     """
     global last_sensor_data, last_sensor_update_time, sensor_warning_printed, sensor_parse_warning_printed
 
@@ -221,22 +280,14 @@ def _sensor_polling_thread():
                 sensor_parse_warning_printed = True
             continue
 
-        # Add normalized frame into history and compute smoothed result (median over history)
-        sensor_history.append(normalized)
-        if len(sensor_history) == 0:
-            smoothed = normalized
-        else:
-            stack = np.stack(sensor_history, axis=0)
-            smoothed = np.median(stack, axis=0).astype(np.int32)
-
+        # Write raw frame directly — no smoothing applied
         with sensor_data_lock:
-            last_sensor_data = smoothed
+            last_sensor_data = normalized
 
-        # If the sensor is returning all max-distance values, warn once
+        # If the sensor is returning all-zero values, warn once (sensor may not be ready)
         if not sensor_warning_printed:
-            flat = smoothed.flatten()
-            if np.all(flat >= SENSOR_MAX_DISTANCE):
-                print(f"ALERT: sensor returning all max-distance values (>= {SENSOR_MAX_DISTANCE}). Check wiring/position.")
+            if np.all(normalized == 0):
+                print("ALERT: sensor returning all-zero values. Check wiring/position.")
                 sensor_warning_printed = True
 
 
@@ -244,19 +295,6 @@ def _sensor_polling_thread():
 sensor_thread = threading.Thread(target=_sensor_polling_thread, daemon=True)
 sensor_thread.start()
 
-def create_grid_canvas():
-    """Create a black canvas with a grid"""
-    canvas = np.zeros((GRID_HEIGHT, GRID_WIDTH, 3), dtype=np.uint8)
-    
-    # Draw vertical lines
-    for x in range(0, GRID_WIDTH, GRID_CELL_SIZE):
-        cv2.line(canvas, (x, 0), (x, GRID_HEIGHT), GRID_COLOR, 1)
-    
-    # Draw horizontal lines
-    for y in range(0, GRID_HEIGHT, GRID_CELL_SIZE):
-        cv2.line(canvas, (0, y), (GRID_WIDTH, y), GRID_COLOR, 1)
-    
-    return canvas
 
 def create_sensor_grid(sensor_data):
     """
@@ -320,8 +358,8 @@ def create_sensor_grid(sensor_data):
             # Fill cell with color
             cv2.rectangle(canvas, (x1 + 1, y1 + 1), (x2 - 1, y2 - 1), color, -1)
             
-            # Add distance text (in mm, or '---' if invalid)
-            if distance == 0 or distance > SENSOR_MAX_DISTANCE:
+            # Add distance text (in mm, or '---' if sensor reports 0 / invalid)
+            if distance == 0:
                 text = "---"
             else:
                 text = f"{int(distance)}"
@@ -399,71 +437,6 @@ def check_sensor_close_in_region(sensor_data, sensor_cells, distance_threshold=4
     return detected_close, min_dist
 
 
-def _normalize_sensor_data(raw_sensor_data):
-    """Normalize sensor data into an 8x8 numpy int32 array.
-
-    Supports:
-    - numpy arrays (1D length 64 or 2D 8x8)
-    - list/tuple data (flat or nested)
-    - dicts with keys like 'distances', 'data', or a single-value mapping
-
-    Returns None when the input cannot be interpreted.
-    """
-    if raw_sensor_data is None:
-        return None
-
-    # Unwrap common dict wrappers
-    if isinstance(raw_sensor_data, dict):
-        for key in ("distances", "distance_mm", "ranging_data", "data", "grid", "frame"):
-            if key in raw_sensor_data:
-                return _normalize_sensor_data(raw_sensor_data[key])
-        # If dict contains a single entry, try that value
-        if len(raw_sensor_data) == 1:
-            return _normalize_sensor_data(next(iter(raw_sensor_data.values())))
-        return None
-
-    # Convert to numpy array where possible
-    try:
-        arr = np.asarray(raw_sensor_data)
-    except Exception:
-        return None
-
-    # If the data is already 8x8, we're good.
-    if arr.shape == (8, 8):
-        return arr.astype(np.int32, copy=False)
-
-    # If it's 1D with 64 values, reshape to 8x8
-    if arr.ndim == 1 and arr.size == 64:
-        try:
-            return arr.reshape((8, 8)).astype(np.int32, copy=False)
-        except Exception:
-            pass
-
-    # If total entries == 64, try reshaping regardless of dims
-    if arr.size == 64:
-        try:
-            return arr.reshape((8, 8)).astype(np.int32, copy=False)
-        except Exception:
-            pass
-
-    # As a fallback, flatten and pad/truncate to 64 values.
-    flat = arr.flatten()
-    if flat.size < 64:
-        pad = np.full(64 - flat.size, SENSOR_MAX_DISTANCE, dtype=np.int32)
-        flat = np.concatenate([flat, pad])
-    elif flat.size > 64:
-        flat = flat[:64]
-
-    # Ensure integer values and replace non-finite with max distance
-    try:
-        flat = flat.astype(np.int32, copy=False)
-    except Exception:
-        flat = np.array(flat, dtype=np.int32)
-
-    flat = np.where(np.isfinite(flat), flat, SENSOR_MAX_DISTANCE).astype(np.int32)
-    return flat.reshape((8, 8))
-
-
 # last_sensor_data is initialized and updated by the background sensor polling thread.
 
 # (Debug printing disabled: only alerts and audio should be emitted)
@@ -539,17 +512,14 @@ while True:
     # (flipping caused sensor/camera mismatch)
     # frame = cv2.flip(frame, 1)
 
-    # Create grid canvas for this frame
-    grid_canvas = create_grid_canvas()
-    
     # Copy latest sensor data (thread-safe) for visualization/detection
     with sensor_data_lock:
         sensor_data = last_sensor_data.copy()
         last_update = last_sensor_update_time
 
-    # If the sensor has not updated in a while, treat it as stale (show empty/large values)
+    # If the sensor has not updated in a while, treat it as stale (show all-zero / no-data)
     if time.time() - last_update > SENSOR_STALE_TIMEOUT:
-        sensor_data = np.full((8, 8), SENSOR_MAX_DISTANCE, dtype=np.int32)
+        sensor_data = np.zeros((8, 8), dtype=np.int32)
     
     # Run YOLO inference on the frame
     results = model(frame, stream=True, verbose=False)
@@ -561,7 +531,11 @@ while True:
 
     # Reset detection list for this frame
     current_frame_detections = []
-    
+    # Track sensor cells covered by a YOLO detection (for unidentifiable-object check)
+    covered_sensor_cells: set = set()
+    # Collect every cell that is close this frame; used to update prev_close_cells
+    current_close_cells: set = set()
+
     for r in results:
         boxes = r.boxes
         for b in boxes:
@@ -569,22 +543,40 @@ while True:
             x1, y1, x2, y2 = b.xyxy[0]
             cls = int(b.cls[0])
             conf = float(b.conf[0])
-            
+
+            center_x = int((x1 + x2) / 2)
+            center_y = int((y1 + y2) / 2)
+
             #draws box on main frame
             cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0,255,0), 2)
 
             label = model.names[cls]
             #if label in OBSTACLE_CLASSES and conf > 0.4:
-            if label not in OBSTACLE_CLASSES:
-                # Store detection data for logging
-                center_x = int((x1 + x2) / 2)
-                center_y = int((y1 + y2) / 2)
+            if label not in neg_OBSTACLE_CLASSES:
                 location_str = f"({center_x}, {center_y})"
                 
-                # Check if sensor detected something close in this object's region
+                # Map the full bounding box to sensor grid cells, then keep only
+                # rows 0–3 (top half of the 8×8 ToF sensor).  Any box that doesn't
+                # overlap the top sensor half will get an empty list and no alert.
                 sensor_cells = map_camera_to_sensor_grid(x1, y1, x2, y2, frame.shape[0], frame.shape[1])
+                sensor_cells = [(r, c) for r, c in sensor_cells if r < 4]
                 sensor_close, sensor_distance = check_sensor_close_in_region(
                     sensor_data, sensor_cells, distance_threshold=CLOSE_THRESHOLD_MM)
+
+                # Track which cells are close this frame (for next-frame confirmation)
+                for _r, _c in sensor_cells:
+                    if 0 < sensor_data[_r, _c] < CLOSE_THRESHOLD_MM:
+                        current_close_cells.add((_r, _c))
+
+                # Require the close reading to have been present last frame too
+                # (eliminates single-frame sensor spikes; raw grid display is unaffected)
+                sensor_close_confirmed = sensor_close and any(
+                    cell in prev_close_cells for cell in sensor_cells
+                    if 0 < sensor_data[cell[0], cell[1]] < CLOSE_THRESHOLD_MM
+                )
+
+                # Mark these cells as covered by a known YOLO object
+                covered_sensor_cells.update(sensor_cells)
                 
                 # determine closest cell inside this region (if sensor data available)
                 closest_cell = None
@@ -608,8 +600,8 @@ while True:
                 
                 cv2.putText(frame, f"{label} ({conf:.1f})", (int(x1), int(y1)-10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,255,0), 2)
-                # Only alert when a close object is detected, and avoid repeating alerts too often
-                if sensor_close:
+                # Only alert when a close reading is confirmed across two consecutive frames
+                if sensor_close_confirmed:
                     obj = _find_tracked_object(label, (center_x, center_y))
                     should_alert = False
 
@@ -640,26 +632,34 @@ while True:
                         if not audio_alert_sent:
                             speak_text(f"Alert: close object detected in {direction} - {label}")
                             audio_alert_sent = True
-                
-                # Scale and draw on grid canvas
-                # Normalize coordinates to grid size
-                grid_x1 = int((x1 / frame.shape[1]) * GRID_WIDTH)
-                grid_y1 = int((y1 / frame.shape[0]) * GRID_HEIGHT)
-                grid_x2 = int((x2 / frame.shape[1]) * GRID_WIDTH)
-                grid_y2 = int((y2 / frame.shape[0]) * GRID_HEIGHT)
-                
-                # Clamp to grid bounds
-                grid_x1 = max(0, min(grid_x1, GRID_WIDTH - 1))
-                grid_y1 = max(0, min(grid_y1, GRID_HEIGHT - 1))
-                grid_x2 = max(0, min(grid_x2, GRID_WIDTH - 1))
-                grid_y2 = max(0, min(grid_y2, GRID_HEIGHT - 1))
-                
-                # Draw box on grid
-                cv2.rectangle(grid_canvas, (grid_x1, grid_y1), (grid_x2, grid_y2), BOX_COLOR, 2)
-                
-                # Add label text on grid
-                cv2.putText(grid_canvas, f"{label} ({conf:.1f})", (grid_x1, grid_y1 - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, TEXT_COLOR, 1)
+
+    # ── Unidentifiable-object check ──────────────────────────────────────────────
+    # If the ToF sensor sees something close in the upper half (rows 0-3) but YOLO
+    # did not identify any object there, alert as "unidentifiable object".
+    # Confirmation required: cell must also have been close in the previous frame.
+    unidentifiable_close = False
+    min_unidentified_dist = None
+    for row in range(4):          # upper half of the 8×8 sensor grid
+        for col in range(8):
+            if (row, col) in covered_sensor_cells:
+                continue          # already accounted for by a known detection
+            dist = int(sensor_data[row, col])
+            if 0 < dist < (CLOSE_THRESHOLD_MM-200):
+                current_close_cells.add((row, col))
+                if (row, col) in prev_close_cells:   # confirmed across two frames
+                    unidentifiable_close = True
+                    if min_unidentified_dist is None or dist < min_unidentified_dist:
+                        min_unidentified_dist = dist
+
+    if unidentifiable_close:
+        #print(f"ALERT: unidentifiable object detected at ~{min_unidentified_dist}mm (sensor, no YOLO match)")
+        if not audio_alert_sent:
+            speak_text("Alert: unidentifiable object detected")
+            audio_alert_sent = True
+
+    # Advance the close-cell history for the next frame's confirmation check
+    prev_close_cells = current_close_cells
+
     
     # Create sensor visualization grid (use last data, or empty grid if no data yet)
     if sensor_data is not None:
@@ -671,7 +671,6 @@ while True:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 128, 128), 2)
     
     cv2.imshow("Obstacle Detection Demo", frame)
-    cv2.imshow("Filtered Detections - Grid View", grid_canvas)
     cv2.imshow("TOF Sensor Grid", sensor_grid)
     
     # Log data to Excel every 0.25 seconds (if available)
