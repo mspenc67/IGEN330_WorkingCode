@@ -5,6 +5,8 @@ import threading
 
 import numpy as np
 import subprocess
+import os
+import tempfile
 from working_cam_sensor.vl53l5cx_sensor import VL53L5CXSensor
 
 # Optional Excel logging support; fall back gracefully if openpyxl is not installed
@@ -18,6 +20,29 @@ except ImportError:
     PatternFill = None  # type: ignore
     Alignment = None  # type: ignore
     _has_openpyxl = False
+
+# Optional scene-description support (Qwen2-VL + keyboard hotkey)
+# Install: pip install transformers torch qwen-vl-utils keyboard Pillow accelerate
+try:
+    from PIL import Image as _PILImage
+    import torch as _torch
+    from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+    from qwen_vl_utils import process_vision_info
+    _has_scene = True
+except ImportError:
+    _PILImage = None          # type: ignore
+    _torch = None             # type: ignore
+    Qwen2VLForConditionalGeneration = None  # type: ignore
+    AutoProcessor = None      # type: ignore
+    process_vision_info = None  # type: ignore
+    _has_scene = False
+
+try:
+    import keyboard as _keyboard
+    _has_keyboard = True
+except ImportError:
+    _keyboard = None          # type: ignore
+    _has_keyboard = False
 
 from datetime import datetime
 
@@ -63,6 +88,158 @@ def speak_text(text: str) -> None:
         if not hasattr(speak_text, "_warned"):
             print(f"ALERT: TTS failed ({e})")
             speak_text._warned = True
+
+
+# ── Scene-description mode ────────────────────────────────────────────────────
+# Triggered by a single press of the headphone power/BT button.
+# The button sends a "play/pause media" HID event on most BT headsets when
+# already connected.  If your X15 sends a different key, change the constant.
+SCENE_TRIGGER_KEY = "play/pause media"
+
+# Qwen2-VL model to use.  2B is fast; swap to "Qwen/Qwen2-VL-7B-Instruct"
+# for higher quality if your hardware allows it.
+SCENE_MODEL_NAME = "Qwen/Qwen2-VL-2B-Instruct"
+
+# Prompt sent to the model — kept terse so the spoken result stays short.
+SCENE_PROMPT = (
+    "You are assisting a visually impaired person. "
+    "Describe the scene in front of them in 1-2 short sentences, "
+    "focusing on the most important objects, people, or hazards."
+)
+
+# Shared state
+_scene_active = threading.Event()   # set while a scene description is running
+_current_frame = None               # latest camera frame (updated each main-loop iteration)
+_qwen_model = None                  # lazily loaded
+_qwen_processor = None
+
+
+def _load_qwen():
+    """Load Qwen2-VL model and processor on first use (lazy to keep startup fast)."""
+    global _qwen_model, _qwen_processor
+    if _qwen_model is not None:
+        return True
+    if not _has_scene:
+        print("ALERT: scene-description packages not installed. "
+              "Run: pip install transformers torch qwen-vl-utils Pillow accelerate")
+        return False
+    try:
+        print("Loading Qwen2-VL model (first use — may take a moment)…")
+        _qwen_model = Qwen2VLForConditionalGeneration.from_pretrained(
+            SCENE_MODEL_NAME,
+            torch_dtype=_torch.bfloat16,  # explicit bfloat16 — fits in 6 GB VRAM
+            device_map="cuda:0",           # force GPU, not CPU fallback
+        )
+        _qwen_processor = AutoProcessor.from_pretrained(SCENE_MODEL_NAME)
+        print("Qwen2-VL model ready.")
+        return True
+    except Exception as e:
+        print(f"ALERT: could not load Qwen2-VL model: {e}")
+        return False
+
+
+def _speak_blocking(text: str) -> None:
+    """Interrupt any current TTS and speak *text*, waiting for it to finish."""
+    global TTS_PROCESS
+    # Kill any currently running TTS so scene speech isn't dropped
+    if TTS_PROCESS is not None and TTS_PROCESS.poll() is None:
+        TTS_PROCESS.terminate()
+        TTS_PROCESS.wait()
+        TTS_PROCESS = None
+    speak_text(text)
+    # Wait for this utterance to complete before returning
+    if TTS_PROCESS is not None:
+        TTS_PROCESS.wait()
+
+
+def _run_scene_description(frame_bgr):
+    """Run Qwen2-VL on *frame_bgr* and speak the result.  Runs in a background thread."""
+    _scene_active.set()
+    print("[SCENE] _run_scene_description() started")
+    try:
+        _speak_blocking("Analyzing scene. Please wait.")
+        print(f"[SCENE] _has_scene={_has_scene}")
+
+        if not _load_qwen():
+            _speak_blocking("Scene description unavailable. Required packages are missing.")
+            return
+
+        # Convert BGR (OpenCV) → RGB PIL image
+        print("[SCENE] Step 1: converting frame to PIL image...")
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        pil_img = _PILImage.fromarray(rgb)
+        print("[SCENE] Step 1: done")
+
+        print("[SCENE] Step 2: building messages...")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": pil_img},
+                    {"type": "text",  "text": SCENE_PROMPT},
+                ],
+            }
+        ]
+        print("[SCENE] Step 2: done")
+
+        print("[SCENE] Step 3: applying chat template...")
+        text_input = _qwen_processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        print("[SCENE] Step 3: done")
+
+        print("[SCENE] Step 4: process_vision_info...")
+        image_inputs, video_inputs = process_vision_info(messages)
+        print("[SCENE] Step 4: done")
+
+        print("[SCENE] Step 5: tokenizing inputs...")
+        inputs = _qwen_processor(
+            text=[text_input],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        ).to(_qwen_model.device)
+        print(f"[SCENE] Step 5: done  (device={_qwen_model.device})")
+
+        print("[SCENE] Step 6: running model.generate()  ← may take 30-120s on CPU...")
+        with _torch.no_grad():
+            output_ids = _qwen_model.generate(**inputs, max_new_tokens=60)
+        print("[SCENE] Step 6: done")
+
+        print("[SCENE] Step 7: decoding output...")
+        generated = output_ids[:, inputs["input_ids"].shape[1]:]
+        description = _qwen_processor.batch_decode(
+            generated, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )[0].strip()
+        print("[SCENE] Step 7: done")
+
+        print(f"[SCENE] Result: {description}")
+        _speak_blocking(description)
+
+    except Exception as e:
+        import traceback
+        print(f"[SCENE] FAILED: {e}")
+        traceback.print_exc()
+        _speak_blocking("Scene description failed.")
+    finally:
+        print("[SCENE] Done — returning to detection mode")
+        _scene_active.clear()
+
+
+def _on_scene_button():
+    """Called when the headphone button is pressed."""
+    global _current_frame
+    print("[SCENE] _on_scene_button() called")
+    if _scene_active.is_set():
+        print("[SCENE] Already active — ignoring press")
+        return
+    snapshot = _current_frame.copy() if _current_frame is not None else None
+    if snapshot is None:
+        print("[SCENE] _current_frame is None — no frame captured yet")
+        return
+    print("[SCENE] Snapshot taken, starting description thread")
+    threading.Thread(target=_run_scene_description, args=(snapshot,), daemon=True).start()
 
 
 def get_direction_descriptor(cx: int, cy: int, frame_w: int, frame_h: int) -> str:
@@ -115,7 +292,7 @@ def _cleanup_tracked_objects(now: float) -> None:
 
 
 # Create YOLO model (suppress verbose output to avoid flooding the terminal)
-model = YOLO("yolov10n.pt", verbose=False)
+model = YOLO("best.pt", verbose=True)
 
 cap = cv2.VideoCapture(0)
 if not cap.isOpened():
@@ -135,14 +312,15 @@ except Exception as e:
     print(f"ALERT: Could not initialize sensor: {e}")
     sensor = None
 
+# Class names must exactly match those used in the loaded model (best.pt = Roboflow custom model).
+# Run: python -c "from ultralytics import YOLO; m=YOLO('best.pt'); print(m.names)"
+# to verify.  Current best.pt classes (Roboflow-trained):
 OBSTACLE_CLASSES = [
-    "bicycle", "car", "motorcycle", "bus", "train", "truck", "boat",
-    "traffic light", "fire hydrant", "stop sign", "parking meter",
-    "person","knife","chair","laptop","cell phone","remote","keyboard","mouse"
-      # stairs requires custom model later
+    "Bike", "Car", "Chair", "Emergency Blue Phone",
+    "Exit sign", "Person", "Pole", "Stairs", "Tree", "Washroom",
 ]
 
-neg_OBSTACLE_CLASSES = [ #filtering OUT rather than filtering IN,
+neg_OBSTACLE_CLASSES = [  # (unused — keeping for reference)
     "person"
 ]
 
@@ -296,6 +474,28 @@ def _sensor_polling_thread():
 sensor_thread = threading.Thread(target=_sensor_polling_thread, daemon=True)
 sensor_thread.start()
 
+# Register headphone button hotkey for scene-description mode.
+# The X15 power/BT button sends "play/pause media" when already connected.
+# If that doesn't work, try "next track" or run: python -c "import keyboard; keyboard.wait()"
+# and press the button to see what key name it registers as.
+if _has_keyboard:
+    try:
+        # Use a low-level hook rather than add_hotkey — more reliable for media keys
+        def _keyboard_hook(event):
+            print(f"[KEY] {event.event_type} '{event.name}'")   # DEBUG: shows every key event
+            if event.event_type == "down" and event.name == SCENE_TRIGGER_KEY:
+                print("[SCENE] Trigger key matched — calling _on_scene_button()")
+                _on_scene_button()
+        _keyboard.hook(_keyboard_hook, suppress=False)
+        print(f"Scene-description mode: press the headphone power button "
+              f"({SCENE_TRIGGER_KEY}) to activate.")
+    except Exception as _e:
+        print(f"ALERT: could not register scene keyboard hook ({_e}). "
+              "Make sure the script is run as Administrator.")
+else:
+    print("ALERT: 'keyboard' package not installed — scene button unavailable. "
+          "Run: pip install keyboard")
+
 
 def create_sensor_grid(sensor_data):
     """
@@ -442,6 +642,27 @@ def check_sensor_close_in_region(sensor_data, sensor_cells, distance_threshold=4
 
 # (Debug printing disabled: only alerts and audio should be emitted)
 
+def _save_workbook_atomic(workbook, filepath: str) -> None:
+    """Save *workbook* to *filepath* atomically.
+
+    Writes to a sibling temp file first, then renames it over the target.
+    This prevents a partial/corrupt file if the process is interrupted mid-save.
+    """
+    dir_ = os.path.dirname(os.path.abspath(filepath))
+    fd, tmp_path = tempfile.mkstemp(suffix=".xlsx", dir=dir_)
+    try:
+        os.close(fd)
+        workbook.save(tmp_path)
+        os.replace(tmp_path, filepath)   # atomic on Windows (NTFS) and POSIX
+    except Exception:
+        # Clean up the temp file if something went wrong
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 # Excel logging setup (optional)
 excel_filename = f"detection_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
 wb = None
@@ -534,6 +755,16 @@ while True:
     # Camera should be used with native orientation to match sensor mapping
     # (flipping caused sensor/camera mismatch)
     # frame = cv2.flip(frame, 1)
+
+    # Keep a reference to the latest frame so the scene-description thread can grab it
+    _current_frame = frame
+
+    # ── Scene-description mode: pause all detection while active ─────────────
+    if _scene_active.is_set():
+        cv2.imshow("Obstacle Detection Demo", frame)
+        if cv2.waitKey(1) == 27:
+            break
+        continue
 
     # Copy latest sensor data (thread-safe) for visualization/detection
     with sensor_data_lock:
@@ -720,17 +951,19 @@ while True:
                 cells_str = ", ".join([f"({r},{c})" for r, c in d['sensor_cells']]) if d['sensor_cells'] else ""
                 is_close_str = "Y" if d['sensor_close'] else ""
                 closest_cell_str = str(d['closest_cell']) if d.get('closest_cell') is not None else ""
+                # Convert numpy types to plain Python so openpyxl can serialise them
+                sensor_dist_val = int(d['sensor_distance']) if d['sensor_distance'] is not None else ""
                 ws.append([
                     timestamp,
                     d['label'],
-                    f"{d['confidence']:.2f}",
+                    round(float(d['confidence']), 2),
                     d['location'],
-                    d['sensor_distance'] if d['sensor_distance'] is not None else "",
+                    sensor_dist_val,
                     cells_str,
                     closest_cell_str,
                     is_close_str,
-                    f"{frame_avg_conf:.2f}",
-                    frame_close_count,
+                    round(float(frame_avg_conf), 2),
+                    int(frame_close_count),
                     frame_close_list
                 ])
 
@@ -741,11 +974,14 @@ while True:
                         ws_close.append([
                             timestamp,
                             d['label'],
-                            d['sensor_distance'],
-                            round(d['confidence'], 2),
+                            int(d['sensor_distance']),       # numpy int32 → Python int
+                            round(float(d['confidence']), 2),
                         ])
 
-            wb.save(excel_filename)
+            try:
+                _save_workbook_atomic(wb, excel_filename)
+            except Exception as _xl_err:
+                print(f"ALERT: could not save Excel log ({_xl_err})")
             last_log_time = current_time
     
     # window event handling and exit conditions
@@ -757,14 +993,19 @@ sensor_stop_event.set()
 if sensor_thread.is_alive():
     sensor_thread.join(timeout=1.0)
 
-cap.release()
+if cap is not None:
+    cap.release()
 cv2.destroyAllWindows()
 if sensor:
     sensor.close()
 
 # Save and close workbook (if logging enabled)
 if _has_openpyxl and wb is not None:
-    wb.save(excel_filename)
+    try:
+        _save_workbook_atomic(wb, excel_filename)
+        print(f"Excel log saved → {excel_filename}")
+    except Exception as _xl_err:
+        print(f"ALERT: final Excel save failed ({_xl_err})")
 
 
 
