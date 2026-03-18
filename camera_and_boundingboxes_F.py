@@ -8,7 +8,6 @@ import subprocess
 import os
 import tempfile
 from working_cam_sensor.vl53l5cx_sensor import VL53L5CXSensor
-
 # Optional Excel logging support; fall back gracefully if openpyxl is not installed
 try:
     from openpyxl import Workbook
