@@ -323,6 +323,56 @@ neg_OBSTACLE_CLASSES = [  # (unused — keeping for reference)
     "person"
 ]
 
+# ── Detection modes ────────────────────────────────────────────────────────────
+# Press volume+ (headphone button) to cycle: 1 → 2 → 3 → 1 …
+#   Mode 1 — Standard  : obstacles only  (no Person / Exit sign / Emergency Blue Phone)
+#   Mode 2 — Social    : everything except Emergency Blue Phone
+#   Mode 3 — Emergency : all classes, no exclusions
+MODES = {
+    1: {
+        "name": "Standard",
+        "spoken": "Mode 1. Standard navigation.",
+        "excluded": {"Person", "Exit sign", "Emergency Blue Phone"},
+    },
+    2: {
+        "name": "Social",
+        "spoken": "Mode 2. Social awareness.",
+        "excluded": {"Emergency Blue Phone"},
+    },
+    3: {
+        "name": "Emergency",
+        "spoken": "Mode 3. Emergency. All objects active.",
+        "excluded": set(),
+    },
+}
+NUM_MODES = len(MODES)
+
+# Key that cycles modes (volume+ on X15 headphones via Windows HID)
+MODE_CYCLE_KEY = "volume up"
+
+# Current active mode — protected by a lock so the keyboard thread can write safely
+_mode_lock = threading.Lock()
+current_mode = 1
+
+
+def get_active_classes() -> set:
+    """Return the set of class labels active in the current detection mode."""
+    with _mode_lock:
+        excluded = MODES[current_mode]["excluded"]
+    return set(OBSTACLE_CLASSES) - excluded
+
+
+def _cycle_mode() -> None:
+    """Advance to the next mode and announce it (runs in the keyboard hook thread)."""
+    global current_mode
+    with _mode_lock:
+        current_mode = (current_mode % NUM_MODES) + 1
+        mode_info = MODES[current_mode]
+    print(f"[MODE] Switched to Mode {current_mode}: {mode_info['name']}  "
+          f"(excluded: {mode_info['excluded'] or 'none'})")
+    _speak_blocking(mode_info["spoken"])
+
+
 # Distance threshold for considering something "close" (in mm)
 CLOSE_THRESHOLD_MM = 1000
 
@@ -482,12 +532,18 @@ if _has_keyboard:
         # Use a low-level hook rather than add_hotkey — more reliable for media keys
         def _keyboard_hook(event):
             print(f"[KEY] {event.event_type} '{event.name}'")   # DEBUG: shows every key event
-            if event.event_type == "down" and event.name == SCENE_TRIGGER_KEY:
+            if event.event_type != "down":
+                return
+            if event.name == SCENE_TRIGGER_KEY:
                 print("[SCENE] Trigger key matched — calling _on_scene_button()")
                 _on_scene_button()
+            elif event.name == MODE_CYCLE_KEY:
+                print("[MODE] Volume+ pressed — cycling detection mode")
+                _cycle_mode()
         _keyboard.hook(_keyboard_hook, suppress=False)
         print(f"Scene-description mode: press the headphone power button "
               f"({SCENE_TRIGGER_KEY}) to activate.")
+        print(f"Mode cycling: press volume+ ({MODE_CYCLE_KEY}) to switch modes (1→2→3→1).")
     except Exception as _e:
         print(f"ALERT: could not register scene keyboard hook ({_e}). "
               "Make sure the script is run as Administrator.")
@@ -805,7 +861,7 @@ while True:
 
             label = model.names[cls]
             #if label in OBSTACLE_CLASSES and conf > 0.4:
-            if label in OBSTACLE_CLASSES:
+            if label in get_active_classes():
                 location_str = f"({center_x}, {center_y})"
                 
                 # Map the full bounding box to sensor grid cells, then keep only
