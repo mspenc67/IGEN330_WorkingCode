@@ -325,24 +325,30 @@ neg_OBSTACLE_CLASSES = [  # (unused — keeping for reference)
 
 # ── Detection modes ────────────────────────────────────────────────────────────
 # Press volume+ (headphone button) to cycle: 1 → 2 → 3 → 1 …
-#   Mode 1 — Standard  : obstacles only  (no Person / Exit sign / Emergency Blue Phone)
-#   Mode 2 — Social    : everything except Emergency Blue Phone
-#   Mode 3 — Emergency : all classes, no exclusions
+#
+#   Mode 1 — Normal    : OBSTACLE_CLASSES minus Person and Exit sign (default)
+#   Mode 2 — Everything: all OBSTACLE_CLASSES + "unidentified object" for anything
+#                        YOLO detects that isn't in OBSTACLE_CLASSES, plus
+#                        sensor-only "unidentified object" alerts
+#   Mode 3 — Emergency : all OBSTACLE_CLASSES, no exclusions, no unknowns
 MODES = {
     1: {
-        "name": "Standard",
-        "spoken": "Mode 1. Standard navigation.",
-        "excluded": {"Person", "Exit sign", "Emergency Blue Phone"},
+        "name": "Normal",
+        "spoken": "Mode 1. Normal mode.",
+        "excluded": {"Person", "Exit sign"},   # everyday navigation — ignore people/signs
+        "catch_unknown": False,                 # don't alert on non-OBSTACLE_CLASSES detections
     },
     2: {
-        "name": "Social",
-        "spoken": "Mode 2. Social awareness.",
-        "excluded": {"Emergency Blue Phone"},
+        "name": "Everything",
+        "spoken": "Mode 2. Everything mode. All objects including unidentified.",
+        "excluded": set(),                      # all OBSTACLE_CLASSES active
+        "catch_unknown": True,                  # also alert on anything YOLO sees outside the list
     },
     3: {
         "name": "Emergency",
-        "spoken": "Mode 3. Emergency. All objects active.",
-        "excluded": set(),
+        "spoken": "Mode 3. Emergency mode. All obstacle classes active.",
+        "excluded": set(),                      # all OBSTACLE_CLASSES active
+        "catch_unknown": False,                 # stick to known classes only
     },
 }
 NUM_MODES = len(MODES)
@@ -362,14 +368,21 @@ def get_active_classes() -> set:
     return set(OBSTACLE_CLASSES) - excluded
 
 
+def mode_catches_unknown() -> bool:
+    """Return True if the current mode should alert on unrecognised YOLO detections."""
+    with _mode_lock:
+        return MODES[current_mode].get("catch_unknown", False)
+
+
 def _cycle_mode() -> None:
     """Advance to the next mode and announce it (runs in the keyboard hook thread)."""
     global current_mode
     with _mode_lock:
         current_mode = (current_mode % NUM_MODES) + 1
         mode_info = MODES[current_mode]
+    excl_str = ", ".join(mode_info["excluded"]) if mode_info["excluded"] else "none"
     print(f"[MODE] Switched to Mode {current_mode}: {mode_info['name']}  "
-          f"(excluded: {mode_info['excluded'] or 'none'})")
+          f"(excluded: {excl_str}, catch_unknown: {mode_info['catch_unknown']})")
     _speak_blocking(mode_info["spoken"])
 
 
@@ -845,6 +858,10 @@ while True:
     # Collect every cell that is close this frame; used to update prev_close_cells
     current_close_cells: set = set()
 
+    # Resolve mode state once per frame (avoids repeated lock acquisition)
+    active_classes = get_active_classes()
+    catch_unknown  = mode_catches_unknown()
+
     for r in results:
         boxes = r.boxes
         for b in boxes:
@@ -860,8 +877,16 @@ while True:
             cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0,255,0), 2)
 
             label = model.names[cls]
-            #if label in OBSTACLE_CLASSES and conf > 0.4:
-            if label in get_active_classes():
+
+            # Determine whether this detection should be processed and under what name
+            if label in active_classes:
+                display_label = label                   # known, active class
+            elif catch_unknown and label not in OBSTACLE_CLASSES:
+                display_label = "unidentified object"   # mode 2: YOLO sees something off-list
+            else:
+                continue                                 # excluded or not catching unknowns
+
+            if True:  # kept for indentation continuity
                 location_str = f"({center_x}, {center_y})"
                 
                 # Map the full bounding box to sensor grid cells, then keep only
@@ -898,7 +923,7 @@ while True:
                             closest_cell = (row, col)
                 
                 current_frame_detections.append({
-                    'label': label,
+                    'label': display_label,
                     'confidence': conf,
                     'location': location_str,
                     'sensor_close': sensor_close,
@@ -908,16 +933,16 @@ while True:
                     'closest_cell': closest_cell
                 })
                 
-                cv2.putText(frame, f"{label} ({conf:.1f})", (int(x1), int(y1)-10),
+                cv2.putText(frame, f"{display_label} ({conf:.1f})", (int(x1), int(y1)-10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,255,0), 2)
                 # Only alert when a close reading is confirmed across two consecutive frames
                 if sensor_close_confirmed:
-                    obj = _find_tracked_object(label, (center_x, center_y))
+                    obj = _find_tracked_object(display_label, (center_x, center_y))
                     should_alert = False
 
                     if obj is None:
                         obj = {
-                            "label": label,
+                            "label": display_label,
                             "center": (center_x, center_y),
                             "last_alert": frame_now,
                             "last_seen": frame_now,
@@ -937,10 +962,10 @@ while True:
 
                     if should_alert:
                         direction = get_direction_descriptor(center_x, center_y, frame.shape[1], frame.shape[0])
-                        alert_msg = f"ALERT: close object detected - {label} at {sensor_distance}mm, cell {closest_cell}"
+                        alert_msg = f"ALERT: close object detected - {display_label} at {sensor_distance}mm, cell {closest_cell}"
                         print(alert_msg)
                         if not audio_alert_sent:
-                            speak_text(f"Alert: close object detected in {direction} - {label}")
+                            speak_text(f"Alert: close object detected in {direction} - {display_label}")
                             audio_alert_sent = True
 
     # ── Unidentifiable-object check ──────────────────────────────────────────────
@@ -960,12 +985,12 @@ while True:
                     unidentifiable_close = True
                     if min_unidentified_dist is None or dist < min_unidentified_dist:
                         min_unidentified_dist = dist
-    #UNIDENTIFIABLE OBJECT CHECK DISABLED
-    #if unidentifiable_close:
-        #print(f"ALERT: unidentifiable object detected at ~{min_unidentified_dist}mm (sensor, no YOLO match)")
-        #if not audio_alert_sent:
-            #speak_text("Alert: unidentifiable object detected")
-            #audio_alert_sent = True
+    # Sensor-only unidentified alert — active only in Mode 2 (catch_unknown)
+    if catch_unknown and unidentifiable_close:
+        print(f"ALERT: unidentified object at ~{min_unidentified_dist}mm (sensor only, no YOLO match)")
+        if not audio_alert_sent:
+            speak_text("Alert: unidentified object detected")
+            audio_alert_sent = True
 
     # Advance the close-cell history for the next frame's confirmation check
     prev_close_cells = current_close_cells
