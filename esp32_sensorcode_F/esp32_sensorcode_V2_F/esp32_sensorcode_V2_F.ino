@@ -25,13 +25,13 @@ void setup() {
   // 3. Optimization: Minimum Integration Time
   // Reducing this increases frequency but lowers max range. 
   // 10ms allows for ~60Hz theoretical peak, though 15-20ms is safer for SNR.
-  myImager.setIntegrationTime(35); 
+  myImager.setIntegrationTime(50); 
   
   // 4. Set Ranging Frequency (Hz)
   // For 8x8, the hardware limit is usually 15Hz. Let's push for 15.
   myImager.setRangingFrequency(15);
 
-  myImager.setSharpenerPercent(15); // Disable sharpening to save processing time
+  myImager.setSharpenerPercent(0); // Disable sharpening to save processing time
   myImager.startRanging();
 }
 

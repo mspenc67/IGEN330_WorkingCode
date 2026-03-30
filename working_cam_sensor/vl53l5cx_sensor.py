@@ -30,11 +30,9 @@ class VL53L5CXSensor:
         self.verbose = verbose
         self.image_resolution = 0
         self.image_width = 0
-        self.max_distance_mm = 4000  # Used for mapping 'no return' values
+        self.max_distance_mm = 4000
         self.serial_conn = None
         self.i2c_sensor = None
-        self._serial_buffer = ""  # buffer to accumulate partial serial blocks
-        self._last_no_data_warn = 0.0
 
         if use_serial:
             self._init_serial(port, baudrate)
@@ -43,7 +41,6 @@ class VL53L5CXSensor:
     
     def _init_serial(self, port, baudrate):
         """Initialize serial communication with ESP32"""
-        # Determine candidate ports to try
         if port is None:
             ports = serial.tools.list_ports.comports()
             if self.verbose:
@@ -51,7 +48,6 @@ class VL53L5CXSensor:
                 for p in ports:
                     print(f"  {p.device}: {p.description}")
 
-            # Prefer common ESP32 / CH340 USB serial adapters (avoid generic Bluetooth COM ports)
             preferred_keywords = ["ch340", "cp21", "usb serial", "silicon labs", "usb-serial"]
             preferred = [p.device for p in ports if any(k in (p.description or "").lower() for k in preferred_keywords)]
             if preferred:
@@ -61,23 +57,24 @@ class VL53L5CXSensor:
         else:
             candidate_ports = [port]
 
-        # Try each port with best-known baud rates
+        # 100 ms readline timeout: long enough to survive Windows USB-CDC latency
+        # (~16 ms per USB frame) while still being fast for a 15 Hz sensor.
+        _SERIAL_TIMEOUT = 0.1
+
         baud_candidates = [baudrate, 250000, 115200, 921600]
         last_exception = None
         for p in candidate_ports:
             for b in baud_candidates:
                 try:
-                    self.serial_conn = serial.Serial(p, b, timeout=1)
+                    self.serial_conn = serial.Serial(p, b, timeout=_SERIAL_TIMEOUT)
                     time.sleep(2)
                     if self.verbose:
                         print(f"Connected to ESP32 on {p} at {b} baud")
                     return
                 except Exception as e:
                     last_exception = e
-                    # Continue trying other baud rates/ports
                     continue
 
-        # If we reach here, we failed to open any port at any baud
         if self.verbose:
             print("Error connecting to serial port:", last_exception)
             print("Make sure ESP32 is connected, the correct port is used, and the firmware is running.")
@@ -136,72 +133,75 @@ class VL53L5CXSensor:
         return self.get_ranging_data()
     
     def _read_serial_data(self):
-        """Read sensor data from ESP32 via serial.
+        """Read one complete 8×8 frame directly from the ESP-32 using readline().
 
-        The ESP32 outputs an 8x8 grid of values (and "---" for no return).
-        The serial stream may contain partial frames, so we buffer until we have a full 8x8 frame.
+        The ESP-32 outputs 8 rows of 8 comma-separated mm values then a blank /
+        space-only line as a frame separator (see esp32_sensorcode_V2_F.ino).
+        readline() blocks until newline or the 100 ms serial timeout — long enough
+        to survive Windows USB-CDC latency without blocking the polling thread.
+
+        Partial lines (no trailing newline → readline() timed out mid-line) are
+        discarded so corrupted rows never enter the frame buffer.
+
+        Returns an (8, 8) int32 numpy array on success, or None when no complete
+        frame is available.
         """
-        # Read any available bytes
-        if not self.serial_conn.in_waiting:
-            now = time.time()
-            if self.verbose and now - self._last_no_data_warn > 5.0:
-                print("WARNING: No serial data arriving from ESP32 (in_waiting=0).")
-                self._last_no_data_warn = now
-            return None
-
-        data = self.serial_conn.read(self.serial_conn.in_waiting).decode('utf-8', errors='ignore')
-        self._serial_buffer += data
-
-        # Debug: print raw data once to help confirm format (avoid flooding terminal)
-        if self.verbose and not hasattr(self, '_raw_dump_shown'):
-            print(f"Raw data sample (first 200 chars): {repr(data[:200])}")
-            self._raw_dump_shown = True
-
-        lines = self._serial_buffer.split("\n")
         distances = []
+        deadline = time.monotonic() + 0.6  # 600 ms budget; ESP-32 runs at ~15 Hz
 
-        for i, line in enumerate(lines):
-            stripped = line.strip()
+        while time.monotonic() < deadline:
+            try:
+                raw = self.serial_conn.readline()
+            except Exception:
+                return None
 
-            # Treat empty lines as frame delimiters
-            if not stripped:
-                if len(distances) == 8:
-                    self._serial_buffer = "\n".join(lines[i+1:])
-                    return np.array(distances, dtype=np.int32)
+            # Empty read: readline() timed out with zero bytes
+            if not raw:
+                if not distances:
+                    return None  # nothing buffered → give up, caller retries
+                continue  # partial frame in progress, keep waiting
+
+            # Partial line: readline() timed out before receiving the newline.
+            # Discard to avoid corrupting the frame with truncated values.
+            if not raw.endswith(b'\n'):
+                distances = []
                 continue
 
-            # Split by comma first (common), otherwise by whitespace
+            line = raw.decode('utf-8', errors='ignore').strip()
+
+            # Blank line (the ESP-32 sends " \n" as frame separator) or explicit marker
+            if not line or line.lower() in ('f', 'frame_end'):
+                if len(distances) == 8:
+                    return np.array(distances, dtype=np.int32)
+                # Wrong row count → we started mid-frame; discard and re-sync
+                distances = []
+                continue
+
             parts = [p.strip() for p in line.split(',')] if ',' in line else line.split()
             row = []
             for tok in parts:
                 if not tok:
                     continue
-                if tok == "---":
-                    row.append(self.image_resolution or self.max_distance_mm)
+                if tok == '---':
+                    row.append(0)
                     continue
                 try:
-                    val = int(tok)
-                    # Treat 0 as max distance (no return)
-                    row.append(self.image_resolution or self.max_distance_mm if val == 0 else val)
+                    row.append(int(tok))
                 except ValueError:
-                    # Non-numeric tokens treated as max distance
-                    row.append(self.image_resolution or self.max_distance_mm)
+                    row.append(0)
 
-            # Pad/truncate to 8 values in case of formatting issues
+            if not row:
+                continue
+
             if len(row) < 8:
-                row.extend([self.image_resolution or self.max_distance_mm] * (8 - len(row)))
+                row.extend([0] * (8 - len(row)))
             elif len(row) > 8:
                 row = row[:8]
 
             distances.append(row)
-
+            # Return as soon as we have 8 valid rows (frame separator consumed next call)
             if len(distances) == 8:
-                self._serial_buffer = "\n".join(lines[i+1:])
                 return np.array(distances, dtype=np.int32)
-
-        # Keep buffer trimmed to avoid unbounded growth
-        if len(self._serial_buffer) > 10000:
-            self._serial_buffer = "\n".join(lines[-20:])
 
         return None
     

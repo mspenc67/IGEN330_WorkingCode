@@ -51,39 +51,34 @@ def _sanitize_speech_text(text: str) -> str:
     return text.replace("'", "''")
 
 
-# Voice settings (Windows TTS)
-VOICE_NAME = "Microsoft Zira Desktop"  # female voice on Windows
 TTS_PROCESS = None
 
 
 def speak_text(text: str) -> None:
     """Speak text using Windows PowerShell TTS (System.Speech).
 
-    This function ensures only one speech process is active at a time.
+    Uses the system default voice so SelectVoice never throws.
+    Errors are printed to the console instead of being silently swallowed.
     """
     global TTS_PROCESS
 
-    # Do not start a new speech process if one is still running.
     if TTS_PROCESS is not None and TTS_PROCESS.poll() is None:
         return
 
     try:
         safe_text = _sanitize_speech_text(text)
         cmd = [
-            "powershell",
-            "-Command",
+            "powershell", "-NoProfile", "-NonInteractive", "-Command",
             (
                 "Add-Type -AssemblyName System.Speech; "
                 "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-                f"$s.SelectVoice('{VOICE_NAME}'); "
-                "$s.Rate = 2; "          # -10 (slowest) to 10 (fastest); 4 = noticeably faster
+                "$s.Rate = 2; "
                 f"$s.Speak('{safe_text}');"
             )
         ]
-        # Fire and forget -- do not block main loop
-        TTS_PROCESS = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Capture stderr so errors print to our console instead of being lost
+        TTS_PROCESS = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=None)
     except Exception as e:
-        # Fallback: print error once, do not keep spamming
         if not hasattr(speak_text, "_warned"):
             print(f"ALERT: TTS failed ({e})")
             speak_text._warned = True
@@ -94,16 +89,18 @@ def speak_text(text: str) -> None:
 # The button sends a "play/pause media" HID event on most BT headsets when
 # already connected.  If your X15 sends a different key, change the constant.
 SCENE_TRIGGER_KEY = "play/pause media"
+MODE_CYCLE_KEY    = "next track"       # headphone forward/next button cycles detection mode
 
 # Qwen2-VL model to use.  2B is fast; swap to "Qwen/Qwen2-VL-7B-Instruct"
 # for higher quality if your hardware allows it.
 SCENE_MODEL_NAME = "Qwen/Qwen2-VL-2B-Instruct"
 
-# Prompt sent to the model — kept terse so the spoken result stays short.
+# Prompt: require complete sentences so the spoken result never cuts off mid-thought.
 SCENE_PROMPT = (
     "You are assisting a visually impaired person. "
-    "Describe the scene in front of them in 1-2 short sentences, "
-    "focusing on the most important objects, people, or hazards."
+    "Describe the scene in front of them in 2-3 complete sentences. "
+    "Every sentence must end with a period. Do not start a sentence you cannot finish. "
+    "Focus on the most important objects, people, or hazards."
 )
 
 # Shared state
@@ -203,7 +200,7 @@ def _run_scene_description(frame_bgr):
 
         print("[SCENE] Step 6: running model.generate()  ← may take 30-120s on CPU...")
         with _torch.no_grad():
-            output_ids = _qwen_model.generate(**inputs, max_new_tokens=60)
+            output_ids = _qwen_model.generate(**inputs, max_new_tokens=200)
         print("[SCENE] Step 6: done")
 
         print("[SCENE] Step 7: decoding output...")
@@ -211,6 +208,12 @@ def _run_scene_description(frame_bgr):
         description = _qwen_processor.batch_decode(
             generated, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )[0].strip()
+
+        # Trim to the last complete sentence so we never speak a half-sentence
+        last_end = max(description.rfind('.'), description.rfind('!'), description.rfind('?'))
+        if last_end > len(description) // 4:
+            description = description[:last_end + 1]
+
         print("[SCENE] Step 7: done")
 
         print(f"[SCENE] Result: {description}")
@@ -335,7 +338,7 @@ MODES = {
     1: {
         "name": "Normal",
         "spoken": "Mode 1. Normal mode.",
-        "excluded": {"Person", "Exit sign"},   # everyday navigation — ignore people/signs
+        "excluded": {"Person", "Exit sign","Emergency Blue Phone"},   # everyday navigation — ignore people/signs
         "catch_unknown": False,                 # don't alert on non-OBSTACLE_CLASSES detections
     },
     2: {
@@ -353,8 +356,9 @@ MODES = {
 }
 NUM_MODES = len(MODES)
 
-# Key that cycles modes (volume+ on X15 headphones via Windows HID)
-MODE_CYCLE_KEY = "volume up"
+# Double-tap window (seconds): second play/pause tap within this window → mode cycle
+# Single tap (or first tap, with no second) → scene description
+DOUBLE_TAP_WINDOW = 0.45
 
 # Current active mode — protected by a lock so the keyboard thread can write safely
 _mode_lock = threading.Lock()
@@ -375,7 +379,7 @@ def mode_catches_unknown() -> bool:
 
 
 def _cycle_mode() -> None:
-    """Advance to the next mode and announce it (runs in the keyboard hook thread)."""
+    """Advance to the next mode and announce it."""
     global current_mode
     with _mode_lock:
         current_mode = (current_mode % NUM_MODES) + 1
@@ -386,8 +390,50 @@ def _cycle_mode() -> None:
     _speak_blocking(mode_info["spoken"])
 
 
+# ── Double-tap state (play/pause button) ─────────────────────────────────────
+_tap_lock = threading.Lock()
+_last_tap_time = 0.0
+_pending_scene_timer: "threading.Timer | None" = None
+
+
+def _on_play_pause_tap():
+    """Route the headphone play/pause button to scene or mode based on tap count.
+
+    Single tap  → scene description (fires after DOUBLE_TAP_WINDOW expires)
+    Double tap  → cycle detection mode (second tap cancels the pending scene timer)
+    """
+    global _last_tap_time, _pending_scene_timer
+    now = time.time()
+    is_double_tap = False
+    old_timer = None
+
+    with _tap_lock:
+        if now - _last_tap_time < DOUBLE_TAP_WINDOW:
+            # Second tap within window → cycle mode
+            _last_tap_time = 0.0           # reset so a 3rd tap starts fresh
+            old_timer = _pending_scene_timer
+            _pending_scene_timer = None
+            is_double_tap = True
+        else:
+            # First tap → schedule scene description after window
+            _last_tap_time = now
+            old_timer = _pending_scene_timer  # cancel any lingering timer
+            t = threading.Timer(DOUBLE_TAP_WINDOW, _on_scene_button)
+            _pending_scene_timer = t
+            t.start()
+
+    if old_timer is not None:
+        old_timer.cancel()
+    if is_double_tap:
+        threading.Thread(target=_cycle_mode, daemon=True).start()
+
+
 # Distance threshold for considering something "close" (in mm)
-CLOSE_THRESHOLD_MM = 1000
+CLOSE_THRESHOLD_MM = 800
+
+# Minimum YOLO confidence to trigger an audio alert.
+# Detections below this are still drawn on screen and logged, but not spoken.
+ALERT_CONFIDENCE_THRESHOLD = 0.5
 
 # How often we remind the user about the same object
 ALERT_REMINDER_SECONDS = 1.0  # reduced from 5.0 for faster re-alerting
@@ -536,33 +582,33 @@ def _sensor_polling_thread():
 sensor_thread = threading.Thread(target=_sensor_polling_thread, daemon=True)
 sensor_thread.start()
 
-# Register headphone button hotkey for scene-description mode.
-# The X15 power/BT button sends "play/pause media" when already connected.
-# If that doesn't work, try "next track" or run: python -c "import keyboard; keyboard.wait()"
-# and press the button to see what key name it registers as.
+# Register headphone button via a low-level hook (most reliable for media keys).
+# on_press_key() silently fails for HID media keys because the scancode lookup
+# is unreliable; hook() fires on every event and we filter by name in the callback.
+#
+# Play/pause tap behaviour:
+#   Single tap  (no second tap within DOUBLE_TAP_WINDOW) → scene description
+#   Double tap  (second tap within DOUBLE_TAP_WINDOW)    → cycle detection mode
 if _has_keyboard:
     try:
-        # Use a low-level hook rather than add_hotkey — more reliable for media keys
         def _keyboard_hook(event):
-            print(f"[KEY] {event.event_type} '{event.name}'")   # DEBUG: shows every key event
             if event.event_type != "down":
                 return
+            print(f"[KEY] '{event.name}'")
             if event.name == SCENE_TRIGGER_KEY:
-                print("[SCENE] Trigger key matched — calling _on_scene_button()")
-                _on_scene_button()
+                _on_play_pause_tap()
             elif event.name == MODE_CYCLE_KEY:
-                print("[MODE] Volume+ pressed — cycling detection mode")
-                _cycle_mode()
+                threading.Thread(target=_cycle_mode, daemon=True).start()
+
         _keyboard.hook(_keyboard_hook, suppress=False)
-        print(f"Scene-description mode: press the headphone power button "
-              f"({SCENE_TRIGGER_KEY}) to activate.")
-        print(f"Mode cycling: press volume+ ({MODE_CYCLE_KEY}) to switch modes (1→2→3→1).")
+        print(f"Headphone controls active:")
+        print(f"  {SCENE_TRIGGER_KEY}  → scene description (single tap) / mode cycle (double tap)")
+        print(f"  {MODE_CYCLE_KEY}     → cycle mode (Normal → Everything → Emergency → Normal)")
     except Exception as _e:
-        print(f"ALERT: could not register scene keyboard hook ({_e}). "
-              "Make sure the script is run as Administrator.")
+        print(f"ALERT: could not register keyboard hook ({_e}). "
+              "Run as Administrator if media keys are not captured.")
 else:
-    print("ALERT: 'keyboard' package not installed — scene button unavailable. "
-          "Run: pip install keyboard")
+    print("ALERT: 'keyboard' package not installed. Run: pip install keyboard")
 
 
 def create_sensor_grid(sensor_data):
@@ -962,9 +1008,8 @@ while True:
 
                     if should_alert:
                         direction = get_direction_descriptor(center_x, center_y, frame.shape[1], frame.shape[0])
-                        alert_msg = f"ALERT: close object detected - {display_label} at {sensor_distance}mm, cell {closest_cell}"
-                        print(alert_msg)
-                        if not audio_alert_sent:
+                        print(f"ALERT: {display_label} at {sensor_distance}mm {direction} (conf={conf:.2f}, cell {closest_cell})")
+                        if not audio_alert_sent and conf >= ALERT_CONFIDENCE_THRESHOLD:
                             speak_text(f"Alert: close object detected in {direction} - {display_label}")
                             audio_alert_sent = True
 
