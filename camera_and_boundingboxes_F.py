@@ -294,7 +294,7 @@ def _cleanup_tracked_objects(now: float) -> None:
 
 
 # Create YOLO model (suppress verbose output to avoid flooding the terminal)
-model = YOLO("best.pt", verbose=True)
+model = YOLO("best4.pt", verbose=True)
 
 cap = cv2.VideoCapture(0)
 if not cap.isOpened():
@@ -314,44 +314,40 @@ except Exception as e:
     print(f"ALERT: Could not initialize sensor: {e}")
     sensor = None
 
-# Class names must exactly match those used in the loaded model (best.pt = Roboflow custom model).
-# Run: python -c "from ultralytics import YOLO; m=YOLO('best.pt'); print(m.names)"
-# to verify.  Current best.pt classes (Roboflow-trained):
+# Class names from best4.pt (Roboflow-trained, 17 classes).
+# Verified with: python -c "from ultralytics import YOLO; m=YOLO('best4.pt'); print(m.names)"
 OBSTACLE_CLASSES = [
-    "Bike", "Car", "Chair", "Emergency Blue Phone",
-    "Exit sign", "Person", "Pole", "Stairs", "Tree", "Washroom",
-]
-
-neg_OBSTACLE_CLASSES = [  # (unused — keeping for reference)
-    "person"
+    "Bike", "Bottle", "Branch", "Chair", "Emergency Blue Phone",
+    "Exit Sign", "Garbage Can", "Person", "Phone", "Pole",
+    "Push to Open Button", "Sanitizer", "Stairs", "Tree",
+    "Vehicle", "Washroom", "Water Fountain",
 ]
 
 # ── Detection modes ────────────────────────────────────────────────────────────
-# Press volume+ (headphone button) to cycle: 1 → 2 → 3 → 1 …
+# next-track button (or double-tap play/pause) cycles: 1 → 2 → 3 → 1 …
 #
-#   Mode 1 — Normal    : OBSTACLE_CLASSES minus Person and Exit sign (default)
-#   Mode 2 — Everything: all OBSTACLE_CLASSES + "unidentified object" for anything
-#                        YOLO detects that isn't in OBSTACLE_CLASSES, plus
-#                        sensor-only "unidentified object" alerts
-#   Mode 3 — Emergency : all OBSTACLE_CLASSES, no exclusions, no unknowns
+#   Mode 1 — Normal    : physical obstacles only; exclude low-hazard informational items
+#   Mode 2 — Everything: all 17 classes + sensor-only "unidentified object" alerts
+#   Mode 3 — Emergency : all 17 classes, known obstacles only (no unknowns)
 MODES = {
     1: {
         "name": "Normal",
         "spoken": "Mode 1. Normal mode.",
-        "excluded": {"Person", "Exit sign","Emergency Blue Phone"},   # everyday navigation — ignore people/signs
-        "catch_unknown": False,                 # don't alert on non-OBSTACLE_CLASSES detections
+        # Exclude items that are rarely physical hazards in everyday navigation
+        "excluded": {"Person", "Emergency Blue Phone", "Exit Sign"},
+        "catch_unknown": False,
     },
     2: {
         "name": "Everything",
         "spoken": "Mode 2. Everything mode. All objects including unidentified.",
-        "excluded": set(),                      # all OBSTACLE_CLASSES active
-        "catch_unknown": True,                  # also alert on anything YOLO sees outside the list
+        "excluded": set(),
+        "catch_unknown": True,
     },
     3: {
         "name": "Emergency",
         "spoken": "Mode 3. Emergency mode. All obstacle classes active.",
-        "excluded": set(),                      # all OBSTACLE_CLASSES active
-        "catch_unknown": False,                 # stick to known classes only
+        "excluded": set(),
+        "catch_unknown": False,
     },
 }
 NUM_MODES = len(MODES)
