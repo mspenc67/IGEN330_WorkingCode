@@ -133,77 +133,52 @@ class VL53L5CXSensor:
         return self.get_ranging_data()
     
     def _read_serial_data(self):
-        """Read one complete 8×8 frame directly from the ESP-32 using readline().
+        """Read one complete 8×8 frame directly from the ESP-32.
 
-        The ESP-32 outputs 8 rows of 8 comma-separated mm values then a blank /
-        space-only line as a frame separator (see esp32_sensorcode_V2_F.ino).
-        readline() blocks until newline or the 100 ms serial timeout — long enough
-        to survive Windows USB-CDC latency without blocking the polling thread.
+        Exact wire format (esp32_sensorcode_V2_F.ino):
+            Row 0 .. 7 : "d0,d1,d2,d3,d4,d5,d6,d7\\n"   (8 comma-separated ints)
+            Frame end  : " \\n"                            (space + newline)
 
-        Partial lines (no trailing newline → readline() timed out mid-line) are
-        discarded so corrupted rows never enter the frame buffer.
-
-        Returns an (8, 8) int32 numpy array on success, or None when no complete
-        frame is available.
+        Returns an (8, 8) int32 numpy array, or None if no complete frame arrived.
         """
-        distances = []
-        deadline = time.monotonic() + 0.6  # 600 ms budget; ESP-32 runs at ~15 Hz
-
-        while time.monotonic() < deadline:
+        rows = []
+        while True:
             try:
                 raw = self.serial_conn.readline()
             except Exception:
                 return None
 
-            # Empty read: readline() timed out with zero bytes
+            # readline() returned nothing → serial timeout, no data available
             if not raw:
-                if not distances:
-                    return None  # nothing buffered → give up, caller retries
-                continue  # partial frame in progress, keep waiting
+                return None
 
-            # Partial line: readline() timed out before receiving the newline.
-            # Discard to avoid corrupting the frame with truncated values.
+            # Partial line (timed out before \n) → discard and resync
             if not raw.endswith(b'\n'):
-                distances = []
+                rows = []
                 continue
 
             line = raw.decode('utf-8', errors='ignore').strip()
 
-            # Blank line (the ESP-32 sends " \n" as frame separator) or explicit marker
-            if not line or line.lower() in ('f', 'frame_end'):
-                if len(distances) == 8:
-                    return np.array(distances, dtype=np.int32)
-                # Wrong row count → we started mid-frame; discard and re-sync
-                distances = []
+            # Frame separator: ESP-32 sends " \n", which strips to ""
+            if not line:
+                if len(rows) == 8:
+                    return np.array(rows, dtype=np.int32)
+                # Started mid-frame — discard and wait for next complete frame
+                rows = []
                 continue
 
-            parts = [p.strip() for p in line.split(',')] if ',' in line else line.split()
-            row = []
-            for tok in parts:
-                if not tok:
-                    continue
-                if tok == '---':
-                    row.append(0)
-                    continue
-                try:
-                    row.append(int(tok))
-                except ValueError:
-                    row.append(0)
-
-            if not row:
+            # Data row: split on commas, parse each token as int
+            try:
+                vals = [int(v) for v in line.split(',')]
+            except ValueError:
+                rows = []   # corrupted row → resync
                 continue
 
-            if len(row) < 8:
-                row.extend([0] * (8 - len(row)))
-            elif len(row) > 8:
-                row = row[:8]
+            if len(vals) != 8:
+                rows = []   # unexpected column count → resync
+                continue
 
-            distances.append(row)
-            # Return as soon as we have 8 valid rows (frame separator consumed next call)
-            if len(distances) == 8:
-                return np.array(distances, dtype=np.int32)
-
-        return None
+            rows.append(vals)
     
     def _read_i2c_data(self):
         """Read sensor data directly via I2C"""

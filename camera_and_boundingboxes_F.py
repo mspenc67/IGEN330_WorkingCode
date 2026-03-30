@@ -2,23 +2,13 @@ from ultralytics import YOLO
 import cv2
 import time
 import threading
+import queue as _queue
+from collections import deque
 
 import numpy as np
 import subprocess
 import os
-import tempfile
 from working_cam_sensor.vl53l5cx_sensor import VL53L5CXSensor
-# Optional Excel logging support; fall back gracefully if openpyxl is not installed
-try:
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment
-    _has_openpyxl = True
-except ImportError:
-    Workbook = None  # type: ignore
-    Font = None  # type: ignore
-    PatternFill = None  # type: ignore
-    Alignment = None  # type: ignore
-    _has_openpyxl = False
 
 # Optional scene-description support (Qwen2-VL + keyboard hotkey)
 # Install: pip install transformers torch qwen-vl-utils keyboard Pillow accelerate
@@ -36,52 +26,177 @@ except ImportError:
     process_vision_info = None  # type: ignore
     _has_scene = False
 
-try:
-    import keyboard as _keyboard
-    _has_keyboard = True
-except ImportError:
-    _keyboard = None          # type: ignore
-    _has_keyboard = False
 
 from datetime import datetime
 
 
 def _sanitize_speech_text(text: str) -> str:
-    """Sanitize text for PowerShell speech synthesis (escape single quotes)."""
+    """Escape single-quotes for PowerShell string literals."""
     return text.replace("'", "''")
 
 
-TTS_PROCESS = None
+# ── Persistent TTS engine ─────────────────────────────────────────────────────
+# One PowerShell process lives for the whole program lifetime.
+# speak_text() writes a line to its stdin — speech starts in ~30 ms instead of
+# the ~400 ms it takes to spawn a fresh powershell.exe each call.
+# A female voice is selected once at startup; SpeakAsync lets the loop return
+# immediately so the next alert can cancel-and-replace the current one.
+
+_TTS_PS_PREAMBLE = (
+    "Add-Type -AssemblyName System.Speech; "
+    "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+    "$s.Rate = 4; "
+    "foreach ($v in $s.GetInstalledVoices()) { "
+    "  if ($v.VoiceInfo.Gender -eq "
+    "[System.Speech.Synthesis.VoiceGender]::Female) { "
+    "    $s.SelectVoice($v.VoiceInfo.Name); break } }; "
+    "while ($true) { "
+    "  $t = [Console]::ReadLine(); "
+    "  if ($null -eq $t) { break }; "
+    "  if ($t -eq '__CANCEL__') { $s.SpeakAsyncCancelAll(); continue }; "
+    "  $s.SpeakAsyncCancelAll(); $s.SpeakAsync($t) "
+    "}"
+)
+
+_tts_queue: _queue.Queue = _queue.Queue()
+_tts_ps_proc = None
+
+
+def _tts_worker() -> None:
+    """Feed the persistent PowerShell TTS process from the queue."""
+    global _tts_ps_proc
+    try:
+        _tts_ps_proc = subprocess.Popen(
+            ["powershell", "-NoProfile", "-NonInteractive",
+             "-Command", _TTS_PS_PREAMBLE],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True, encoding="utf-8", bufsize=1,
+        )
+    except Exception as exc:
+        print(f"ALERT: persistent TTS failed to start ({exc})")
+        return
+
+    while True:
+        text = _tts_queue.get()
+        if text is None:
+            break
+        try:
+            _tts_ps_proc.stdin.write(text + "\n")
+            _tts_ps_proc.stdin.flush()
+        except Exception:
+            break
+
+
+_tts_thread = threading.Thread(target=_tts_worker, daemon=True)
+_tts_thread.start()
 
 
 def speak_text(text: str) -> None:
-    """Speak text using Windows PowerShell TTS (System.Speech).
+    """Speak *text* via the warm persistent TTS process (~30 ms latency).
 
-    Uses the system default voice so SelectVoice never throws.
-    Errors are printed to the console instead of being silently swallowed.
+    Drops any queued-but-not-yet-spoken item so the freshest alert always wins.
     """
-    global TTS_PROCESS
+    # Discard stale queued items — only the latest alert matters
+    while True:
+        try:
+            _tts_queue.get_nowait()
+        except _queue.Empty:
+            break
+    _tts_queue.put_nowait(text)
 
-    if TTS_PROCESS is not None and TTS_PROCESS.poll() is None:
-        return
 
-    try:
-        safe_text = _sanitize_speech_text(text)
-        cmd = [
-            "powershell", "-NoProfile", "-NonInteractive", "-Command",
-            (
-                "Add-Type -AssemblyName System.Speech; "
-                "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-                "$s.Rate = 2; "
-                f"$s.Speak('{safe_text}');"
-            )
-        ]
-        # Capture stderr so errors print to our console instead of being lost
-        TTS_PROCESS = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=None)
-    except Exception as e:
-        if not hasattr(speak_text, "_warned"):
-            print(f"ALERT: TTS failed ({e})")
-            speak_text._warned = True
+# ── Alert-log panel ───────────────────────────────────────────────────────────
+# Rolling list of the last N spoken alerts; rendered as a small cv2 window.
+ALERT_LOG_MAX    = 14        # rows to keep
+ALERT_PANEL_W    = 620
+ALERT_PANEL_H    = 320
+
+_alert_log: deque = deque(maxlen=ALERT_LOG_MAX)   # (hh:mm:ss, text, bgr_colour)
+_alert_log_lock  = threading.Lock()
+
+# colour palette for the panel
+_CLR_OBSTACLE  = (0,  200, 255)   # amber  — close obstacle
+_CLR_UNKNOWN   = (0,  80,  220)   # red    — unidentified sensor hit
+_CLR_MODE      = (180, 255, 100)  # green  — mode change
+_CLR_SCENE     = (255, 200,  80)  # blue   — scene description event
+_CLR_DIM       = (120, 120, 120)  # grey   — timestamp / divider
+
+
+def _log_alert(text: str, color: tuple = _CLR_OBSTACLE, speak: bool = True) -> None:
+    """Append *text* to the on-screen alert log and optionally speak it."""
+    ts = datetime.now().strftime('%H:%M:%S')
+    with _alert_log_lock:
+        _alert_log.appendleft((ts, text, color))
+    if speak:
+        speak_text(text)
+
+
+def _natural_direction(direction: str) -> str:
+    """Convert a grid direction string to a natural-sounding TTS phrase."""
+    d = direction.lower()
+    if d == "center":
+        return "ahead of you"
+    if d == "upper":
+        return "above you"
+    if d == "bottom":
+        return "below you"
+    return f"to your {d}"
+
+
+def _format_alert_text(label: str, direction: str, distance_mm: int | None) -> str:
+    """Return the spoken + displayed alert string in the standard format."""
+    dir_phrase = _natural_direction(direction)
+    if distance_mm is not None:
+        dist_cm = max(1, round(distance_mm / 10))
+        return f"Alert: there is a {label} {dir_phrase}, {dist_cm} centimeters away"
+    return f"Alert: there is a {label} {dir_phrase}"
+
+
+def create_alert_panel() -> np.ndarray:
+    """Render the rolling alert log as a small BGR image for cv2.imshow."""
+    canvas = np.full((ALERT_PANEL_H, ALERT_PANEL_W, 3), 25, dtype=np.uint8)
+
+    # ── header bar ──────────────────────────────────────────────────────────
+    with _mode_lock:
+        mode_name = MODES[current_mode]["name"]
+    cv2.rectangle(canvas, (0, 0), (ALERT_PANEL_W, 34), (45, 45, 45), -1)
+    cv2.putText(canvas, f"Audio Alerts",
+                (8, 23), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 1)
+    mode_label = f"Mode {current_mode}: {mode_name}"
+    (tw, _), _ = cv2.getTextSize(mode_label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+    cv2.putText(canvas, mode_label,
+                (ALERT_PANEL_W - tw - 8, 23),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, _CLR_MODE, 1)
+
+    # divider
+    cv2.line(canvas, (0, 35), (ALERT_PANEL_W, 35), (60, 60, 60), 1)
+
+    # ── log rows ────────────────────────────────────────────────────────────
+    with _alert_log_lock:
+        entries = list(_alert_log)
+
+    y = 56
+    row_h = 20
+    for ts, text, color in entries:
+        if y + row_h > ALERT_PANEL_H:
+            break
+        # timestamp
+        cv2.putText(canvas, ts, (6, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, _CLR_DIM, 1)
+        # alert text — truncate if wider than panel (ASCII "..." avoids OpenCV Unicode issues)
+        max_chars = 62
+        display = text if len(text) <= max_chars else text[:max_chars - 3] + "..."
+        cv2.putText(canvas, display, (76, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, color, 1)
+        y += row_h
+
+    if not entries:
+        cv2.putText(canvas, "No alerts yet.", (12, 62),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, _CLR_DIM, 1)
+
+    return canvas
 
 
 # ── Scene-description mode ────────────────────────────────────────────────────
@@ -135,17 +250,24 @@ def _load_qwen():
 
 
 def _speak_blocking(text: str) -> None:
-    """Interrupt any current TTS and speak *text*, waiting for it to finish."""
-    global TTS_PROCESS
-    # Kill any currently running TTS so scene speech isn't dropped
-    if TTS_PROCESS is not None and TTS_PROCESS.poll() is None:
-        TTS_PROCESS.terminate()
-        TTS_PROCESS.wait()
-        TTS_PROCESS = None
-    speak_text(text)
-    # Wait for this utterance to complete before returning
-    if TTS_PROCESS is not None:
-        TTS_PROCESS.wait()
+    """Cancel any async speech and speak *text* via the warm persistent process.
+
+    Puts a __CANCEL__ through the queue first to stop anything in progress,
+    then sends the new text and waits long enough for it to finish.
+    No new PowerShell process is spawned, so latency is ~30 ms.
+    """
+    # Drain stale queued items
+    while True:
+        try:
+            _tts_queue.get_nowait()
+        except _queue.Empty:
+            break
+    # Cancel current speech then speak the new text
+    _tts_queue.put_nowait("__CANCEL__")
+    _tts_queue.put_nowait(text)
+    # Estimate how long the phrase will take at Rate=4 (~110 wpm → ~1.8 char/s)
+    wait_s = max(2.0, len(text) / 14.0)
+    time.sleep(wait_s)
 
 
 def _run_scene_description(frame_bgr):
@@ -153,6 +275,7 @@ def _run_scene_description(frame_bgr):
     _scene_active.set()
     print("[SCENE] _run_scene_description() started")
     try:
+        _log_alert("Analyzing scene. Please wait.", color=_CLR_SCENE, speak=False)
         _speak_blocking("Analyzing scene. Please wait.")
         print(f"[SCENE] _has_scene={_has_scene}")
 
@@ -217,6 +340,7 @@ def _run_scene_description(frame_bgr):
         print("[SCENE] Step 7: done")
 
         print(f"[SCENE] Result: {description}")
+        _log_alert(description, color=_CLR_SCENE, speak=False)
         _speak_blocking(description)
 
     except Exception as e:
@@ -273,28 +397,10 @@ def get_direction_descriptor(cx: int, cy: int, frame_w: int, frame_h: int) -> st
     return f"{vert} {horiz}"
 
 
-def _euclidean_dist(p0, p1):
-    return ((p0[0] - p1[0]) ** 2 + (p0[1] - p1[1]) ** 2) ** 0.5
-
-
-def _find_tracked_object(label: str, center: tuple[int, int]) -> dict | None:
-    """Find a previously tracked object with the same label and nearby location."""
-    for obj in tracked_objects:
-        if obj["label"] != label:
-            continue
-        if _euclidean_dist(center, obj["center"]) < TRACKED_OBJECT_MOVE_THRESHOLD_PX:
-            return obj
-    return None
-
-
-def _cleanup_tracked_objects(now: float) -> None:
-    """Remove tracked objects that have not been seen recently."""
-    global tracked_objects
-    tracked_objects = [obj for obj in tracked_objects if (now - obj.get("last_seen", 0)) < TRACKED_OBJECT_MAX_AGE]
 
 
 # Create YOLO model (suppress verbose output to avoid flooding the terminal)
-model = YOLO("best4.pt", verbose=True)
+model = YOLO("best6.pt", verbose=True)
 
 cap = cv2.VideoCapture(0)
 if not cap.isOpened():
@@ -306,12 +412,15 @@ if not cap.isOpened():
 # For direct I2C, use: sensor = VL53L5CXSensor(use_serial=False)
 # Auto-detect ESP32 on serial port (quiet mode):
 try:
-    # Use the ToF sensor via ESP32 serial output.
-    # Set verbose=False for clean output; enable for debugging if needed.
-    sensor = VL53L5CXSensor(port=None, baudrate=250000, use_serial=True, verbose=False)
+    sensor = VL53L5CXSensor(port=None, baudrate=250000, use_serial=True, verbose=True)
+    if sensor.serial_conn is not None:
+        print(f"[SENSOR] Connected on {sensor.serial_conn.port} at {sensor.serial_conn.baudrate} baud")
+    else:
+        print("[SENSOR] WARNING: serial_conn is None after init — no data will arrive")
+        sensor = None
 except Exception as e:
-    # permission or port errors are expected if device busy; warn once
-    print(f"ALERT: Could not initialize sensor: {e}")
+    print(f"[SENSOR] ALERT: Could not initialize sensor: {e}")
+    print("[SENSOR]   Check: ESP32 is plugged in, correct COM port, firmware running.")
     sensor = None
 
 # Class names from best4.pt (Roboflow-trained, 17 classes).
@@ -383,6 +492,7 @@ def _cycle_mode() -> None:
     excl_str = ", ".join(mode_info["excluded"]) if mode_info["excluded"] else "none"
     print(f"[MODE] Switched to Mode {current_mode}: {mode_info['name']}  "
           f"(excluded: {excl_str}, catch_unknown: {mode_info['catch_unknown']})")
+    _log_alert(mode_info["spoken"], color=_CLR_MODE, speak=False)
     _speak_blocking(mode_info["spoken"])
 
 
@@ -425,21 +535,22 @@ def _on_play_pause_tap():
 
 
 # Distance threshold for considering something "close" (in mm)
-CLOSE_THRESHOLD_MM = 800
+CLOSE_THRESHOLD_MM = 1000
 
 # Minimum YOLO confidence to trigger an audio alert.
 # Detections below this are still drawn on screen and logged, but not spoken.
-ALERT_CONFIDENCE_THRESHOLD = 0.5
+ALERT_CONFIDENCE_THRESHOLD = 0.7
 
 # How often we remind the user about the same object
-ALERT_REMINDER_SECONDS = 1.0  # reduced from 5.0 for faster re-alerting
+# Global audio cooldown: after any spoken alert, silence all audio for this many
+# seconds so the current message can be heard in full before the next one fires.
+# The spoken phrase takes ~2 s at Rate=4; 2.5 s gives a small buffer.
+AUDIO_GLOBAL_COOLDOWN  = 3.5   # seconds
+_last_audio_time       = 0.0   # timestamp of the most recently spoken alert
 
 # If an object stays in roughly the same place, we consider it "the same object".
-TRACKED_OBJECT_MOVE_THRESHOLD_PX = 80  # pixels for center movement
-TRACKED_OBJECT_MAX_AGE = 10.0  # seconds before forgetting a tracked object
 
 # Tracking objects over time so we can re-alert only after a reminder interval
-tracked_objects = []  # each entry: {label, center, last_alert, last_seen}
 
 # Sensor cells that were below CLOSE_THRESHOLD_MM in the most recent frame.
 # A reading is only treated as real if it appears in TWO consecutive frames,
@@ -578,33 +689,45 @@ def _sensor_polling_thread():
 sensor_thread = threading.Thread(target=_sensor_polling_thread, daemon=True)
 sensor_thread.start()
 
-# Register headphone button via a low-level hook (most reliable for media keys).
-# on_press_key() silently fails for HID media keys because the scancode lookup
-# is unreliable; hook() fires on every event and we filter by name in the callback.
-#
-# Play/pause tap behaviour:
-#   Single tap  (no second tap within DOUBLE_TAP_WINDOW) → scene description
-#   Double tap  (second tap within DOUBLE_TAP_WINDOW)    → cycle detection mode
-if _has_keyboard:
-    try:
-        def _keyboard_hook(event):
-            if event.event_type != "down":
-                return
-            print(f"[KEY] '{event.name}'")
-            if event.name == SCENE_TRIGGER_KEY:
-                _on_play_pause_tap()
-            elif event.name == MODE_CYCLE_KEY:
-                threading.Thread(target=_cycle_mode, daemon=True).start()
+# Use pynput for headphone button detection — it correctly handles Bluetooth
+# HID Consumer Control events that the 'keyboard' library cannot see.
+try:
+    from pynput import keyboard as _pynput_kb
 
-        _keyboard.hook(_keyboard_hook, suppress=False)
-        print(f"Headphone controls active:")
-        print(f"  {SCENE_TRIGGER_KEY}  → scene description (single tap) / mode cycle (double tap)")
-        print(f"  {MODE_CYCLE_KEY}     → cycle mode (Normal → Everything → Emergency → Normal)")
-    except Exception as _e:
-        print(f"ALERT: could not register keyboard hook ({_e}). "
-              "Run as Administrator if media keys are not captured.")
-else:
-    print("ALERT: 'keyboard' package not installed. Run: pip install keyboard")
+    def _on_pynput_press(key):
+        # Filter out held modifier spam before printing
+        if key not in (_pynput_kb.Key.shift, _pynput_kb.Key.shift_l,
+                       _pynput_kb.Key.shift_r, _pynput_kb.Key.ctrl,
+                       _pynput_kb.Key.ctrl_l, _pynput_kb.Key.ctrl_r,
+                       _pynput_kb.Key.alt, _pynput_kb.Key.alt_l,
+                       _pynput_kb.Key.alt_r):
+            print(f"[KEY] {key!r}")
+
+        # ── Headphone media buttons ───────────────────────────────────────
+        if key == _pynput_kb.Key.media_play_pause:
+            _on_play_pause_tap()
+        elif key == _pynput_kb.Key.media_next:
+            threading.Thread(target=_cycle_mode, daemon=True).start()
+
+        # ── Keyboard fallback (no headphones) ────────────────────────────
+        # M → cycle detection mode    S → scene description
+        elif hasattr(key, 'char'):
+            if key.char == 'm':
+                threading.Thread(target=_cycle_mode, daemon=True).start()
+            elif key.char == 's':
+                _on_scene_button()
+
+    _pynput_listener = _pynput_kb.Listener(on_press=_on_pynput_press)
+    _pynput_listener.start()
+    print("Headphone controls active (pynput):")
+    print("  play/pause      → scene description (single tap) / mode cycle (double tap)")
+    print("  next track      → cycle detection mode")
+    print("Keyboard fallback (no headphones):")
+    print("  M               → cycle detection mode")
+    print("  S               → scene description")
+
+except Exception as _ke:
+    print(f"[KEY] pynput listener failed: {_ke}")
 
 
 def create_sensor_grid(sensor_data):
@@ -725,7 +848,7 @@ def map_camera_to_sensor_grid(x1, y1, x2, y2, frame_height, frame_width):
     
     return sensor_cells
 
-def check_sensor_close_in_region(sensor_data, sensor_cells, distance_threshold=400):
+def check_sensor_close_in_region(sensor_data, sensor_cells, distance_threshold=1000):
     """
     Check if sensor detected an object within distance_threshold (mm) in the specified region
     Returns tuple: (detected_close: bool, min_distance: int or None)
@@ -752,100 +875,6 @@ def check_sensor_close_in_region(sensor_data, sensor_cells, distance_threshold=4
 
 # (Debug printing disabled: only alerts and audio should be emitted)
 
-def _save_workbook_atomic(workbook, filepath: str) -> None:
-    """Save *workbook* to *filepath* atomically.
-
-    Writes to a sibling temp file first, then renames it over the target.
-    This prevents a partial/corrupt file if the process is interrupted mid-save.
-    """
-    dir_ = os.path.dirname(os.path.abspath(filepath))
-    fd, tmp_path = tempfile.mkstemp(suffix=".xlsx", dir=dir_)
-    try:
-        os.close(fd)
-        workbook.save(tmp_path)
-        os.replace(tmp_path, filepath)   # atomic on Windows (NTFS) and POSIX
-    except Exception:
-        # Clean up the temp file if something went wrong
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-        raise
-
-
-# Excel logging setup (optional)
-excel_filename = f"detection_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-wb = None
-ws = None
-ws_close = None  # second sheet: confirmed-close detections only
-if _has_openpyxl:
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Detections"
-
-    # Create header row with styling (one row per detection)
-    headers = [
-        "Timestamp",
-        "Object Class",
-        "Confidence",
-        "Location (px)",
-        "Sensor Distance (mm)",
-        "Sensor Cells",
-        "Closest Cell",
-        "Is Close",
-        "Frame Avg Confidence",
-        "Frame Close Count",
-        "Frame Close Objects"
-    ]
-    ws.append(headers)
-
-    # Style header row
-    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-    header_font = Font(bold=True, color="FFFFFF")
-
-    for cell in ws[1]:
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-
-    # Column widths
-    ws.column_dimensions['A'].width = 25  # Timestamp
-    ws.column_dimensions['B'].width = 18  # Object class
-    ws.column_dimensions['C'].width = 12  # Confidence
-    ws.column_dimensions['D'].width = 18  # Location
-    ws.column_dimensions['E'].width = 20  # Sensor distance
-    ws.column_dimensions['F'].width = 30  # Sensor cells
-    ws.column_dimensions['G'].width = 15  # Closest cell
-    ws.column_dimensions['H'].width = 10  # Is close
-    ws.column_dimensions['I'].width = 18  # Frame average conf
-    ws.column_dimensions['J'].width = 15  # Frame close count
-    ws.column_dimensions['K'].width = 40  # Frame close objects
-
-    # ── Second sheet: one row per confirmed-close detection event ──────────────
-    ws_close = wb.create_sheet(title="Close Detections")
-    close_headers = [
-        "Timestamp",
-        "Object Class",
-        "Sensor Distance (mm)",
-        "YOLO Confidence",
-    ]
-    ws_close.append(close_headers)
-
-    close_header_fill = PatternFill(start_color="C00000", end_color="C00000", fill_type="solid")
-    for cell in ws_close[1]:
-        cell.fill = close_header_fill
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-
-    ws_close.column_dimensions['A'].width = 25  # Timestamp
-    ws_close.column_dimensions['B'].width = 18  # Object class
-    ws_close.column_dimensions['C'].width = 22  # Sensor distance
-    ws_close.column_dimensions['D'].width = 18  # YOLO confidence
-
-# Tracking for 0.25 second interval data logging
-last_log_time = time.time()
-LOG_INTERVAL = 0.25  # seconds
-current_frame_detections = []
 
 # optional auto-termination to prevent unresponsive pop-ups during testing
 MAX_RUNTIME = 30  # seconds; set to None to run indefinitely
@@ -882,8 +911,12 @@ while True:
         last_update = last_sensor_update_time
 
     # If the sensor has not updated in a while, treat it as stale (show all-zero / no-data)
-    if time.time() - last_update > SENSOR_STALE_TIMEOUT:
+    _now = time.time()
+    if _now - last_update > SENSOR_STALE_TIMEOUT:
         sensor_data = np.zeros((8, 8), dtype=np.int32)
+        if sensor is not None and _now - last_update > 3.0 and not getattr(_sensor_polling_thread, '_stale_warned', False):
+            print("[SENSOR] WARNING: no data received for >3 s — check ESP32 connection")
+            _sensor_polling_thread._stale_warned = True
     
     # Run YOLO inference on the frame
     results = model(frame, stream=True, verbose=False)
@@ -891,10 +924,8 @@ while True:
     # Track whether we've already spoken an alert this frame (one audio at a time)
     audio_alert_sent = False
     frame_now = time.time()
-    _cleanup_tracked_objects(frame_now)
 
     # Reset detection list for this frame
-    current_frame_detections = []
     # Track sensor cells covered by a YOLO detection (for unidentifiable-object check)
     covered_sensor_cells: set = set()
     # Collect every cell that is close this frame; used to update prev_close_cells
@@ -930,12 +961,36 @@ while True:
 
             if True:  # kept for indentation continuity
                 location_str = f"({center_x}, {center_y})"
-                
-                # Map the full bounding box to sensor grid cells, then keep only
-                # rows 0–3 (top half of the 8×8 ToF sensor).  Any box that doesn't
-                # overlap the top sensor half will get an empty list and no alert.
-                sensor_cells = map_camera_to_sensor_grid(x1, y1, x2, y2, frame.shape[0], frame.shape[1])
-                sensor_cells = [(r, c) for r, c in sensor_cells if r < 4]
+                direction = get_direction_descriptor(center_x, center_y, frame.shape[1], frame.shape[0])
+
+                cv2.putText(frame, f"{display_label} ({conf:.1f})", (int(x1), int(y1)-10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,255,0), 2)
+
+                # ── Special case: Exit Sign in Emergency mode ─────────────────
+                # Alert purely on camera detection — no distance check needed.
+                with _mode_lock:
+                    _em_mode = current_mode == 3
+                if display_label == "Exit Sign" and _em_mode:
+                    print(f"EXIT SIGN detected {direction} (conf={conf:.2f})")
+                    if (not audio_alert_sent
+                            and conf >= ALERT_CONFIDENCE_THRESHOLD
+                            and (frame_now - _last_audio_time) >= AUDIO_GLOBAL_COOLDOWN):
+                        _last_audio_time = frame_now
+                        msg = f"Alert: Exit Sign {_natural_direction(direction)}"
+                        _log_alert(msg, color=_CLR_OBSTACLE)
+                        audio_alert_sent = True
+                    # Skip sensor-distance logic for Exit Sign
+                    continue
+
+                # ── Sensor-distance gating ────────────────────────────────────
+                # Stairs: check ALL sensor rows (they appear at the bottom of frame).
+                # Everything else: restrict to upper rows to reduce false positives.
+                if display_label == "Stairs":
+                    sensor_cells = map_camera_to_sensor_grid(x1, y1, x2, y2, frame.shape[0], frame.shape[1])
+                else:
+                    sensor_cells = map_camera_to_sensor_grid(x1, y1, x2, y2, frame.shape[0], frame.shape[1])
+                    sensor_cells = [(r, c) for r, c in sensor_cells if r < 6]
+
                 sensor_close, sensor_distance = check_sensor_close_in_region(
                     sensor_data, sensor_cells, distance_threshold=CLOSE_THRESHOLD_MM)
 
@@ -945,7 +1000,6 @@ while True:
                         current_close_cells.add((_r, _c))
 
                 # Require the close reading to have been present last frame too
-                # (eliminates single-frame sensor spikes; raw grid display is unaffected)
                 sensor_close_confirmed = sensor_close and any(
                     cell in prev_close_cells for cell in sensor_cells
                     if 0 < sensor_data[cell[0], cell[1]] < CLOSE_THRESHOLD_MM
@@ -953,61 +1007,18 @@ while True:
 
                 # Mark these cells as covered by a known YOLO object
                 covered_sensor_cells.update(sensor_cells)
-                
-                # determine closest cell inside this region (if sensor data available)
-                closest_cell = None
-                if sensor_data is not None and sensor_cells:
-                    min_dist = float('inf')
-                    for row, col in sensor_cells:
-                        d = sensor_data[row, col]
-                        if 0 < d < min_dist:
-                            min_dist = d
-                            closest_cell = (row, col)
-                
-                current_frame_detections.append({
-                    'label': display_label,
-                    'confidence': conf,
-                    'location': location_str,
-                    'sensor_close': sensor_close,
-                    'sensor_close_confirmed': sensor_close_confirmed,
-                    'sensor_distance': sensor_distance,
-                    'sensor_cells': sensor_cells,
-                    'closest_cell': closest_cell
-                })
-                
-                cv2.putText(frame, f"{display_label} ({conf:.1f})", (int(x1), int(y1)-10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,255,0), 2)
-                # Only alert when a close reading is confirmed across two consecutive frames
+
+                # Alert every confirmed-close detection; AUDIO_GLOBAL_COOLDOWN
+                # prevents back-to-back audio — no per-object tracking needed.
                 if sensor_close_confirmed:
-                    obj = _find_tracked_object(display_label, (center_x, center_y))
-                    should_alert = False
-
-                    if obj is None:
-                        obj = {
-                            "label": display_label,
-                            "center": (center_x, center_y),
-                            "last_alert": frame_now,
-                            "last_seen": frame_now,
-                        }
-                        tracked_objects.append(obj)
-                        should_alert = True
-                    else:
-                        # Update location and last seen time
-                        moved = _euclidean_dist((center_x, center_y), obj["center"])
-                        obj["center"] = (center_x, center_y)
-                        obj["last_seen"] = frame_now
-
-                        # Remind only if object hasn't moved much and cooldown passed
-                        if (frame_now - obj.get("last_alert", 0)) > ALERT_REMINDER_SECONDS and moved < TRACKED_OBJECT_MOVE_THRESHOLD_PX:
-                            should_alert = True
-                            obj["last_alert"] = frame_now
-
-                    if should_alert:
-                        direction = get_direction_descriptor(center_x, center_y, frame.shape[1], frame.shape[0])
-                        print(f"ALERT: {display_label} at {sensor_distance}mm {direction} (conf={conf:.2f}, cell {closest_cell})")
-                        if not audio_alert_sent and conf >= ALERT_CONFIDENCE_THRESHOLD:
-                            speak_text(f"Alert: close object detected in {direction} - {display_label}")
-                            audio_alert_sent = True
+                    print(f"ALERT: {display_label} at {sensor_distance}mm {direction} (conf={conf:.2f})")
+                    if (not audio_alert_sent
+                            and conf >= ALERT_CONFIDENCE_THRESHOLD
+                            and (frame_now - _last_audio_time) >= AUDIO_GLOBAL_COOLDOWN):
+                        _last_audio_time = frame_now
+                        msg = _format_alert_text(display_label, direction, sensor_distance)
+                        _log_alert(msg, color=_CLR_OBSTACLE)
+                        audio_alert_sent = True
 
     # ── Unidentifiable-object check ──────────────────────────────────────────────
     # If the ToF sensor sees something close in the upper half (rows 0-3) but YOLO
@@ -1029,8 +1040,9 @@ while True:
     # Sensor-only unidentified alert — active only in Mode 2 (catch_unknown)
     if catch_unknown and unidentifiable_close:
         print(f"ALERT: unidentified object at ~{min_unidentified_dist}mm (sensor only, no YOLO match)")
-        if not audio_alert_sent:
-            speak_text("Alert: unidentified object detected")
+        if not audio_alert_sent and (frame_now - _last_audio_time) >= AUDIO_GLOBAL_COOLDOWN+3:
+            _last_audio_time = frame_now
+            _log_alert(_format_alert_text("unidentified object", "center", min_unidentified_dist), color=_CLR_UNKNOWN)
             audio_alert_sent = True
 
     # Advance the close-cell history for the next frame's confirmation check
@@ -1048,62 +1060,7 @@ while True:
     
     cv2.imshow("Obstacle Detection Demo", frame)
     cv2.imshow("TOF Sensor Grid", sensor_grid)
-    
-    # Log data to Excel every 0.25 seconds (if available)
-    if _has_openpyxl:
-        current_time = time.time()
-        if current_time - last_log_time >= LOG_INTERVAL:
-            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-            total_instances = len(current_frame_detections)
-            
-            # frame-level metrics
-            if total_instances > 0:
-                frame_avg_conf = sum(d['confidence'] for d in current_frame_detections) / total_instances
-                close_objs = [d['label'] for d in current_frame_detections if d['sensor_close']]
-                frame_close_count = len(close_objs)
-                frame_close_list = ", ".join(close_objs)
-            else:
-                frame_avg_conf = 0
-                frame_close_count = 0
-                frame_close_list = ""
-            
-            # add one row per detection (main sheet)
-            for d in current_frame_detections:
-                cells_str = ", ".join([f"({r},{c})" for r, c in d['sensor_cells']]) if d['sensor_cells'] else ""
-                is_close_str = "Y" if d['sensor_close'] else ""
-                closest_cell_str = str(d['closest_cell']) if d.get('closest_cell') is not None else ""
-                # Convert numpy types to plain Python so openpyxl can serialise them
-                sensor_dist_val = int(d['sensor_distance']) if d['sensor_distance'] is not None else ""
-                ws.append([
-                    timestamp,
-                    d['label'],
-                    round(float(d['confidence']), 2),
-                    d['location'],
-                    sensor_dist_val,
-                    cells_str,
-                    closest_cell_str,
-                    is_close_str,
-                    round(float(frame_avg_conf), 2),
-                    int(frame_close_count),
-                    frame_close_list
-                ])
-
-            # "Close Detections" sheet — one row per confirmed-close event only
-            if ws_close is not None:
-                for d in current_frame_detections:
-                    if d.get('sensor_close_confirmed') and d['sensor_distance'] is not None:
-                        ws_close.append([
-                            timestamp,
-                            d['label'],
-                            int(d['sensor_distance']),       # numpy int32 → Python int
-                            round(float(d['confidence']), 2),
-                        ])
-
-            try:
-                _save_workbook_atomic(wb, excel_filename)
-            except Exception as _xl_err:
-                print(f"ALERT: could not save Excel log ({_xl_err})")
-            last_log_time = current_time
+    cv2.imshow("Alert Log", create_alert_panel())
     
     # window event handling and exit conditions
     if cv2.waitKey(1) == 27:
@@ -1120,13 +1077,6 @@ cv2.destroyAllWindows()
 if sensor:
     sensor.close()
 
-# Save and close workbook (if logging enabled)
-if _has_openpyxl and wb is not None:
-    try:
-        _save_workbook_atomic(wb, excel_filename)
-        print(f"Excel log saved → {excel_filename}")
-    except Exception as _xl_err:
-        print(f"ALERT: final Excel save failed ({_xl_err})")
 
 
 
