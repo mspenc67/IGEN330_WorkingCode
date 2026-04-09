@@ -150,8 +150,8 @@ def _format_alert_text(label: str, direction: str, distance_mm: int | None) -> s
     dir_phrase = _natural_direction(direction)
     if distance_mm is not None:
         dist_cm = max(1, round(distance_mm / 10))
-        return f"Alert: there is a {label} {dir_phrase}, {dist_cm} centimeters away"
-    return f"Alert: there is a {label} {dir_phrase}"
+        return f"There is a {label} {dir_phrase}, {dist_cm} centimeters away"
+    return f"There is a {label} {dir_phrase}"
 
 
 def create_alert_panel() -> np.ndarray:
@@ -195,6 +195,170 @@ def create_alert_panel() -> np.ndarray:
     if not entries:
         cv2.putText(canvas, "No alerts yet.", (12, 62),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, _CLR_DIM, 1)
+
+    return canvas
+
+
+# ── Unified dashboard ─────────────────────────────────────────────────────────
+# 1920×1080 canvas: matches Full HD so fullscreen is not stretched; camera is 1000².
+# Video is square canvas (pad-only after rotate): full FOV, then scaled to 1000² slot.
+#
+#   Total width 1920 = 1000 (camera) + 920 (ToF + alerts, stacked to same height)
+
+_FONT          = cv2.FONT_HERSHEY_DUPLEX   # more professional than SIMPLEX
+_DASH_TITLE_H  = 80
+_DASH_CAM_W    = 1000                      # square camera panel — max on this layout
+_DASH_CAM_H    = 1000
+_DASH_PAD      = 10                        # inner padding for all panels
+_DASH_SIDE_W   = 1920 - _DASH_CAM_W        # 920
+_DASH_GRID_H   = 520
+_DASH_ALERT_H  = _DASH_CAM_H - _DASH_GRID_H   # 480
+_DASH_TOTAL_W  = 1920
+_DASH_TOTAL_H  = _DASH_TITLE_H + _DASH_CAM_H  # 1080
+
+_DASH_ACCENT   = (194, 120, 40)    # BGR — gold/amber accent
+_DASH_BG       = (14, 14, 14)      # near-black background
+_DASH_WIN_NAME = "Accessibility Navigation Assistant"
+
+
+def _prepare_camera_frame(img: np.ndarray) -> np.ndarray:
+    """Rotate 90° CCW, then pad to a square with **no cropping**.
+
+    Square side = max(width, height) so **every** camera pixel is kept. That is
+    a wider field of view than center-cropping to min(w, h), which looked zoomed.
+    Expect letterbox/pillar bands (_DASH_BG) on one axis when the sensor is not square.
+    """
+    if img is None or img.size == 0:
+        return img
+    rot = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    h, w = rot.shape[:2]
+    side = max(w, h)
+    out = np.full((side, side, 3), _DASH_BG, dtype=np.uint8)
+    x0 = (side - w) // 2
+    y0 = (side - h) // 2
+    out[y0 : y0 + h, x0 : x0 + w] = rot
+    return out
+
+
+def _draw_dashboard(cam_frame: np.ndarray,
+                    sensor_grid: np.ndarray) -> np.ndarray:
+    """Compose camera, sensor grid, and alert log into one 1920×1080 image."""
+    canvas = np.full((_DASH_TOTAL_H, _DASH_TOTAL_W, 3), _DASH_BG, dtype=np.uint8)
+    top = _DASH_TITLE_H
+    sx  = _DASH_CAM_W
+    F   = _FONT
+
+    # ── Title bar ─────────────────────────────────────────────────────────────
+    cv2.rectangle(canvas, (0, 0), (_DASH_TOTAL_W, _DASH_TITLE_H), (22, 22, 22), -1)
+    # accent stripe on the left
+    cv2.rectangle(canvas, (0, 0), (8, _DASH_TITLE_H), _DASH_ACCENT, -1)
+
+    cv2.putText(canvas, "Accessibility Navigation Assistant",
+                (24, 46), F, 1.0, (235, 235, 235), 1, cv2.LINE_AA)
+    cv2.putText(canvas, "IGEN 330  |  Real-Time Obstacle Detection",
+                (24, 70), F, 0.44, (130, 130, 130), 1, cv2.LINE_AA)
+
+    # mode badge — right-aligned
+    with _mode_lock:
+        _m    = current_mode
+        _mname = MODES[_m]["name"]
+    badge = f"Mode {_m}:  {_mname}"
+    (bw, bh), _ = cv2.getTextSize(badge, F, 0.58, 1)
+    bx = _DASH_TOTAL_W - bw - 20
+    by = _DASH_TITLE_H // 2 + bh // 2 - 2
+    cv2.rectangle(canvas, (bx - 12, by - bh - 8), (bx + bw + 8, by + 8),
+                  (38, 38, 38), -1)
+    cv2.rectangle(canvas, (bx - 12, by - bh - 8), (bx + bw + 8, by + 8),
+                  _DASH_ACCENT, 1)
+    cv2.putText(canvas, badge, (bx, by), F, 0.58, _CLR_MODE, 1, cv2.LINE_AA)
+
+    # bottom border of title bar
+    cv2.line(canvas, (0, _DASH_TITLE_H - 1),
+             (_DASH_TOTAL_W, _DASH_TITLE_H - 1), _DASH_ACCENT, 2)
+
+    # ── Camera panel (square canvas from _prepare_camera_frame; resize to slot) ─
+    ch, cw = cam_frame.shape[:2]
+    if cw != _DASH_CAM_W or ch != _DASH_CAM_H:
+        interp = cv2.INTER_AREA if max(ch, cw) > _DASH_CAM_W else cv2.INTER_LINEAR
+        cam_disp = cv2.resize(cam_frame, (_DASH_CAM_W, _DASH_CAM_H), interpolation=interp)
+    else:
+        cam_disp = cam_frame
+    canvas[top:top + _DASH_CAM_H, 0:_DASH_CAM_W] = cam_disp
+
+    # red alert flash border around camera
+    since_alert = time.time() - _last_audio_time
+    if since_alert < 0.7:
+        intensity = int(220 * (1.0 - since_alert / 0.7))
+        cv2.rectangle(canvas, (2, top + 2),
+                      (_DASH_CAM_W - 3, top + _DASH_CAM_H - 3),
+                      (0, 0, intensity), 5)
+
+    # ── Panel label helper ────────────────────────────────────────────────────
+    def _panel_header(img, label, y0=0, w=None):
+        """Draw a section header bar with label text."""
+        w = w or img.shape[1]
+        cv2.rectangle(img, (0, y0), (w, y0 + 28), (32, 32, 32), -1)
+        cv2.rectangle(img, (0, y0), (5, y0 + 28), _DASH_ACCENT, -1)
+        cv2.putText(img, label, (12, y0 + 20),
+                    F, 0.48, (200, 200, 200), 1, cv2.LINE_AA)
+        cv2.line(img, (0, y0 + 28), (w, y0 + 28), (55, 55, 55), 1)
+
+    # ── Sensor grid panel (8×8 stays square — no non-uniform stretch) ──────
+    grid_panel = np.full((_DASH_GRID_H, _DASH_SIDE_W, 3), 18, dtype=np.uint8)
+    _panel_header(grid_panel, "ToF Distance Sensor  (8 x 8)")
+    canvas[top:top + _DASH_GRID_H, sx:sx + _DASH_SIDE_W] = grid_panel
+
+    inner_w = _DASH_SIDE_W - 2 * _DASH_PAD
+    inner_h = _DASH_GRID_H - 28 - 2 * _DASH_PAD
+    sq = min(inner_w, inner_h)
+    # NEAREST keeps cell edges crisp on the square grid
+    ginner = cv2.resize(sensor_grid, (sq, sq), interpolation=cv2.INTER_NEAREST)
+    gx_off = sx + _DASH_PAD + (inner_w - sq) // 2
+    gy_off = top + 28 + _DASH_PAD + (inner_h - sq) // 2
+    canvas[gy_off : gy_off + sq, gx_off : gx_off + sq] = ginner
+
+    # divider between grid and alert panel
+    div_y = top + _DASH_GRID_H
+    cv2.line(canvas, (sx, div_y), (sx + _DASH_SIDE_W, div_y), (55, 55, 55), 1)
+
+    # ── Alert log panel ───────────────────────────────────────────────────────
+    ay = div_y
+    alert_panel = np.full((_DASH_ALERT_H, _DASH_SIDE_W, 3), 18, dtype=np.uint8)
+    _panel_header(alert_panel, "Audio Alerts")
+
+    with _alert_log_lock:
+        entries = list(_alert_log)
+
+    log_y  = 28 + _DASH_PAD + 18   # start below header
+    row_h  = 26                     # generous row spacing
+    ts_x   = _DASH_PAD
+    txt_x  = ts_x + 72
+    max_w  = _DASH_SIDE_W - txt_x - _DASH_PAD
+
+    for ts, text, color in entries:
+        if log_y + row_h > _DASH_ALERT_H - 4:
+            break
+        cv2.putText(alert_panel, ts, (ts_x, log_y),
+                    F, 0.38, _CLR_DIM, 1, cv2.LINE_AA)
+        # fit text to available width
+        scale = 0.50
+        (tw, _), _ = cv2.getTextSize(text, F, scale, 1)
+        while tw > max_w and len(text) > 10:
+            text = text[:-4] + "..."
+            (tw, _), _ = cv2.getTextSize(text, F, scale, 1)
+        cv2.putText(alert_panel, text, (txt_x, log_y),
+                    F, scale, color, 1, cv2.LINE_AA)
+        log_y += row_h
+
+    if not entries:
+        cv2.putText(alert_panel, "No alerts yet.",
+                    (_DASH_PAD, 28 + _DASH_PAD + 22),
+                    F, 0.5, _CLR_DIM, 1, cv2.LINE_AA)
+
+    canvas[ay:ay + _DASH_ALERT_H, sx:sx + _DASH_SIDE_W] = alert_panel
+
+    # ── Vertical divider between camera and right column ─────────────────────
+    cv2.line(canvas, (sx, top), (sx, _DASH_TOTAL_H), (55, 55, 55), 1)
 
     return canvas
 
@@ -402,10 +566,16 @@ def get_direction_descriptor(cx: int, cy: int, frame_w: int, frame_h: int) -> st
 # Create YOLO model (suppress verbose output to avoid flooding the terminal)
 model = YOLO("best6.pt", verbose=True)
 
-cap = cv2.VideoCapture(0)
+cap = cv2.VideoCapture(1)
 if not cap.isOpened():
     print("ALERT: camera could not be opened")
     cap = None
+
+if cap is not None:
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # keep only the latest frame in the OS buffer
+    cap.set(cv2.CAP_PROP_FPS, 60)          # request higher FPS from the camera driver
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
 # Initialize VL53L5CX sensor
 # For serial communication (ESP32), use: sensor = VL53L5CXSensor(port='COM3')  # Replace with your COM port
@@ -535,11 +705,13 @@ def _on_play_pause_tap():
 
 
 # Distance threshold for considering something "close" (in mm)
-CLOSE_THRESHOLD_MM = 1000
+CLOSE_THRESHOLD_MM = 1300
 
 # Minimum YOLO confidence to trigger an audio alert.
 # Detections below this are still drawn on screen and logged, but not spoken.
-ALERT_CONFIDENCE_THRESHOLD = 0.7
+# Keep this at 0.5: objects at 600-1300 mm appear smaller in frame and YOLO
+# assigns confidence ~0.3-0.6; 0.8 was silencing the whole useful alert range.
+ALERT_CONFIDENCE_THRESHOLD = 0.5
 
 # How often we remind the user about the same object
 # Global audio cooldown: after any spoken alert, silence all audio for this many
@@ -848,7 +1020,7 @@ def map_camera_to_sensor_grid(x1, y1, x2, y2, frame_height, frame_width):
     
     return sensor_cells
 
-def check_sensor_close_in_region(sensor_data, sensor_cells, distance_threshold=1000):
+def check_sensor_close_in_region(sensor_data, sensor_cells, distance_threshold=1300):
     """
     Check if sensor detected an object within distance_threshold (mm) in the specified region
     Returns tuple: (detected_close: bool, min_distance: int or None)
@@ -876,31 +1048,109 @@ def check_sensor_close_in_region(sensor_data, sensor_cells, distance_threshold=1
 # (Debug printing disabled: only alerts and audio should be emitted)
 
 
+# ── Threaded camera capture ───────────────────────────────────────────────────
+# Captures and prepares frames in a background thread so cap.read() never
+# stalls the display/YOLO loop.  read() always returns the freshest frame.
+
+class _FrameBuffer:
+    """Background thread that continuously grabs and prepares camera frames."""
+    def __init__(self, cap):
+        self._cap   = cap
+        self._frame = None
+        self._lock  = threading.Lock()
+        self._stop  = threading.Event()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        while not self._stop.is_set():
+            ret, raw = self._cap.read()
+            if not ret:
+                time.sleep(0.005)
+                continue
+            prepared = _prepare_camera_frame(raw)
+            with self._lock:
+                self._frame = prepared
+
+    def read(self):
+        """Return a copy of the latest prepared frame, or None if not ready yet."""
+        with self._lock:
+            f = self._frame
+        return None if f is None else f.copy()
+
+    def stop(self):
+        self._stop.set()
+
+
+frame_buffer = _FrameBuffer(cap) if cap is not None else None
+
+
+# ── Threaded YOLO inference ───────────────────────────────────────────────────
+# YOLO runs in a dedicated thread so the display loop is never blocked.
+# Detections are stored as plain tuples; the display loop reads the latest batch.
+
+YOLO_IMGSZ = 320   # inference input size: 320 = ~4× faster than 640, slightly less accurate
+
+_yolo_detections: list = []            # latest: [(x1,y1,x2,y2,cls_int,conf_float), ...]
+_yolo_det_lock   = threading.Lock()
+_yolo_input      = None                # frame submitted for next inference pass
+_yolo_input_lock = threading.Lock()
+_yolo_trigger    = threading.Event()   # set by main loop, cleared by worker
+_yolo_stop_ev    = threading.Event()
+
+
+def _yolo_worker():
+    global _yolo_detections
+    while not _yolo_stop_ev.is_set():
+        if not _yolo_trigger.wait(timeout=0.1):
+            continue
+        _yolo_trigger.clear()
+        with _yolo_input_lock:
+            frame = _yolo_input
+        if frame is None:
+            continue
+        try:
+            dets = []
+            for r in model(frame, stream=True, verbose=False, imgsz=YOLO_IMGSZ, conf=0.20):
+                for b in r.boxes:
+                    x1, y1, x2, y2 = b.xyxy[0].tolist()
+                    dets.append((x1, y1, x2, y2, int(b.cls[0]), float(b.conf[0])))
+            with _yolo_det_lock:
+                _yolo_detections = dets
+        except Exception as _yolo_exc:
+            print(f"[YOLO] inference error: {_yolo_exc}")
+
+
+_yolo_inf_thread = threading.Thread(target=_yolo_worker, daemon=True)
+_yolo_inf_thread.start()
+
+
+# Dashboard window: explicit pixel size (1920×1080) — do not use AUTOSIZE or the
+# aspect ratio can drift and the layout looks stretched / non-square.
+cv2.namedWindow(_DASH_WIN_NAME, cv2.WINDOW_NORMAL)
+cv2.resizeWindow(_DASH_WIN_NAME, _DASH_TOTAL_W, _DASH_TOTAL_H)
+
 # optional auto-termination to prevent unresponsive pop-ups during testing
 MAX_RUNTIME = 30  # seconds; set to None to run indefinitely
 start_time = time.time()
 
 while True:
-    if cap is None:
-        # No camera available; continue running using a black placeholder frame
+    if frame_buffer is None:
+        # No camera available — use a black placeholder frame
         frame = np.zeros((480, 640, 3), dtype=np.uint8)
-        ret = True
     else:
-        ret, frame = cap.read()
-        if not ret:
-            print("ALERT: camera frame grab failed, exiting")
-            break
-
-    # Camera should be used with native orientation to match sensor mapping
-    # (flipping caused sensor/camera mismatch)
-    # frame = cv2.flip(frame, 1)
+        frame = frame_buffer.read()
+        if frame is None:
+            # Buffer not ready yet — yield and retry
+            if cv2.waitKey(1) == 27:
+                break
+            continue
 
     # Keep a reference to the latest frame so the scene-description thread can grab it
     _current_frame = frame
 
     # ── Scene-description mode: pause all detection while active ─────────────
     if _scene_active.is_set():
-        cv2.imshow("Obstacle Detection Demo", frame)
+        cv2.imshow(_DASH_WIN_NAME, _draw_dashboard(frame, create_sensor_grid(last_sensor_data)))
         if cv2.waitKey(1) == 27:
             break
         continue
@@ -918,14 +1168,19 @@ while True:
             print("[SENSOR] WARNING: no data received for >3 s — check ESP32 connection")
             _sensor_polling_thread._stale_warned = True
     
-    # Run YOLO inference on the frame
-    results = model(frame, stream=True, verbose=False)
-    
+    # Submit this frame to the async YOLO inference thread (non-blocking)
+    with _yolo_input_lock:
+        _yolo_input = frame   # frame_buffer.read() already returns a fresh copy
+    _yolo_trigger.set()
+
+    # Fetch the most recent detections (may be ~1 frame old — acceptable for real-time use)
+    with _yolo_det_lock:
+        current_detections = list(_yolo_detections)
+
     # Track whether we've already spoken an alert this frame (one audio at a time)
     audio_alert_sent = False
     frame_now = time.time()
 
-    # Reset detection list for this frame
     # Track sensor cells covered by a YOLO detection (for unidentifiable-object check)
     covered_sensor_cells: set = set()
     # Collect every cell that is close this frame; used to update prev_close_cells
@@ -935,90 +1190,81 @@ while True:
     active_classes = get_active_classes()
     catch_unknown  = mode_catches_unknown()
 
-    for r in results:
-        boxes = r.boxes
-        for b in boxes:
-            #bounding box locations USE FOR SENSOR
-            x1, y1, x2, y2 = b.xyxy[0]
-            cls = int(b.cls[0])
-            conf = float(b.conf[0])
+    for (x1, y1, x2, y2, cls, conf) in current_detections:
+        center_x = int((x1 + x2) / 2)
+        center_y = int((y1 + y2) / 2)
 
-            center_x = int((x1 + x2) / 2)
-            center_y = int((y1 + y2) / 2)
+        cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0,255,0), 2)
 
-            #draws box on main frame
-            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0,255,0), 2)
+        label = model.names[cls]
 
-            label = model.names[cls]
+        # Determine whether this detection should be processed and under what name
+        if label in active_classes:
+            display_label = label                   # known, active class
+        elif catch_unknown and label not in OBSTACLE_CLASSES:
+            display_label = "unidentified object"   # mode 2: YOLO sees something off-list
+        else:
+            continue                                 # excluded or not catching unknowns
 
-            # Determine whether this detection should be processed and under what name
-            if label in active_classes:
-                display_label = label                   # known, active class
-            elif catch_unknown and label not in OBSTACLE_CLASSES:
-                display_label = "unidentified object"   # mode 2: YOLO sees something off-list
-            else:
-                continue                                 # excluded or not catching unknowns
+        location_str = f"({center_x}, {center_y})"
+        direction = get_direction_descriptor(center_x, center_y, frame.shape[1], frame.shape[0])
 
-            if True:  # kept for indentation continuity
-                location_str = f"({center_x}, {center_y})"
-                direction = get_direction_descriptor(center_x, center_y, frame.shape[1], frame.shape[0])
+        cv2.putText(frame, f"{display_label} ({conf:.1f})", (int(x1), int(y1)-10),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,255,0), 2)
 
-                cv2.putText(frame, f"{display_label} ({conf:.1f})", (int(x1), int(y1)-10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,255,0), 2)
+        # ── Special case: Exit Sign in Emergency mode ─────────────────────────
+        # Alert purely on camera detection — no distance check needed.
+        with _mode_lock:
+            _em_mode = current_mode == 3
+        if display_label == "Exit Sign" and _em_mode:
+            print(f"EXIT SIGN detected {direction} (conf={conf:.2f})")
+            if (not audio_alert_sent
+                    and conf >= ALERT_CONFIDENCE_THRESHOLD
+                    and (frame_now - _last_audio_time) >= AUDIO_GLOBAL_COOLDOWN):
+                _last_audio_time = frame_now
+                msg = f"Exit Sign {_natural_direction(direction)}"
+                _log_alert(msg, color=_CLR_OBSTACLE)
+                audio_alert_sent = True
+            # Skip sensor-distance logic for Exit Sign
+            continue
 
-                # ── Special case: Exit Sign in Emergency mode ─────────────────
-                # Alert purely on camera detection — no distance check needed.
-                with _mode_lock:
-                    _em_mode = current_mode == 3
-                if display_label == "Exit Sign" and _em_mode:
-                    print(f"EXIT SIGN detected {direction} (conf={conf:.2f})")
-                    if (not audio_alert_sent
-                            and conf >= ALERT_CONFIDENCE_THRESHOLD
-                            and (frame_now - _last_audio_time) >= AUDIO_GLOBAL_COOLDOWN):
-                        _last_audio_time = frame_now
-                        msg = f"Alert: Exit Sign {_natural_direction(direction)}"
-                        _log_alert(msg, color=_CLR_OBSTACLE)
-                        audio_alert_sent = True
-                    # Skip sensor-distance logic for Exit Sign
-                    continue
+        # ── Sensor-distance gating ────────────────────────────────────────────
+        # Stairs: check ALL sensor rows (they appear at the bottom of frame).
+        # Everything else: restrict to upper rows to reduce false positives.
+        if display_label == "Stairs":
+            sensor_cells = map_camera_to_sensor_grid(x1, y1, x2, y2, frame.shape[0], frame.shape[1])
+        else:
+            sensor_cells = map_camera_to_sensor_grid(x1, y1, x2, y2, frame.shape[0], frame.shape[1])
+            sensor_cells = [(sr, sc) for sr, sc in sensor_cells if sr < 6]
 
-                # ── Sensor-distance gating ────────────────────────────────────
-                # Stairs: check ALL sensor rows (they appear at the bottom of frame).
-                # Everything else: restrict to upper rows to reduce false positives.
-                if display_label == "Stairs":
-                    sensor_cells = map_camera_to_sensor_grid(x1, y1, x2, y2, frame.shape[0], frame.shape[1])
-                else:
-                    sensor_cells = map_camera_to_sensor_grid(x1, y1, x2, y2, frame.shape[0], frame.shape[1])
-                    sensor_cells = [(r, c) for r, c in sensor_cells if r < 6]
+        sensor_close, sensor_distance = check_sensor_close_in_region(
+            sensor_data, sensor_cells, distance_threshold=CLOSE_THRESHOLD_MM)
 
-                sensor_close, sensor_distance = check_sensor_close_in_region(
-                    sensor_data, sensor_cells, distance_threshold=CLOSE_THRESHOLD_MM)
+        # Track which cells are close this frame (for next-frame confirmation)
+        for _r, _c in sensor_cells:
+            if 0 < sensor_data[_r, _c] < CLOSE_THRESHOLD_MM:
+                current_close_cells.add((_r, _c))
 
-                # Track which cells are close this frame (for next-frame confirmation)
-                for _r, _c in sensor_cells:
-                    if 0 < sensor_data[_r, _c] < CLOSE_THRESHOLD_MM:
-                        current_close_cells.add((_r, _c))
+        # Require the close reading to have been present last frame too
+        sensor_close_confirmed = sensor_close and any(
+            cell in prev_close_cells for cell in sensor_cells
+            if 0 < sensor_data[cell[0], cell[1]] < CLOSE_THRESHOLD_MM
+        )
 
-                # Require the close reading to have been present last frame too
-                sensor_close_confirmed = sensor_close and any(
-                    cell in prev_close_cells for cell in sensor_cells
-                    if 0 < sensor_data[cell[0], cell[1]] < CLOSE_THRESHOLD_MM
-                )
+        # Mark these cells as covered by a known YOLO object
+        covered_sensor_cells.update(sensor_cells)
 
-                # Mark these cells as covered by a known YOLO object
-                covered_sensor_cells.update(sensor_cells)
-
-                # Alert every confirmed-close detection; AUDIO_GLOBAL_COOLDOWN
-                # prevents back-to-back audio — no per-object tracking needed.
-                if sensor_close_confirmed:
-                    print(f"ALERT: {display_label} at {sensor_distance}mm {direction} (conf={conf:.2f})")
-                    if (not audio_alert_sent
-                            and conf >= ALERT_CONFIDENCE_THRESHOLD
-                            and (frame_now - _last_audio_time) >= AUDIO_GLOBAL_COOLDOWN):
-                        _last_audio_time = frame_now
-                        msg = _format_alert_text(display_label, direction, sensor_distance)
-                        _log_alert(msg, color=_CLR_OBSTACLE)
-                        audio_alert_sent = True
+        # Alert every confirmed-close detection; AUDIO_GLOBAL_COOLDOWN
+        # prevents back-to-back audio — no per-object tracking needed.
+        if sensor_close_confirmed:
+            print(f"{display_label} at {sensor_distance}mm {direction} (conf={conf:.2f})")
+            if (not audio_alert_sent
+                    and conf >= ALERT_CONFIDENCE_THRESHOLD
+                    and (frame_now - _last_audio_time) >= AUDIO_GLOBAL_COOLDOWN):
+                _last_audio_time = frame_now
+                msg = _format_alert_text(display_label, direction, sensor_distance)
+                _log_alert(msg, color=_CLR_OBSTACLE)
+                audio_alert_sent = True
 
     # ── Unidentifiable-object check ──────────────────────────────────────────────
     # If the ToF sensor sees something close in the upper half (rows 0-3) but YOLO
@@ -1039,7 +1285,7 @@ while True:
                         min_unidentified_dist = dist
     # Sensor-only unidentified alert — active only in Mode 2 (catch_unknown)
     if catch_unknown and unidentifiable_close:
-        print(f"ALERT: unidentified object at ~{min_unidentified_dist}mm (sensor only, no YOLO match)")
+        print(f"unidentified object at ~{min_unidentified_dist}mm (sensor only, no YOLO match)")
         if not audio_alert_sent and (frame_now - _last_audio_time) >= AUDIO_GLOBAL_COOLDOWN+3:
             _last_audio_time = frame_now
             _log_alert(_format_alert_text("unidentified object", "center", min_unidentified_dist), color=_CLR_UNKNOWN)
@@ -1058,18 +1304,23 @@ while True:
         cv2.putText(sensor_grid, "Waiting for sensor data...", (SENSOR_GRID_SIZE//2 - 150, SENSOR_GRID_SIZE//2),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 128, 128), 2)
     
-    cv2.imshow("Obstacle Detection Demo", frame)
-    cv2.imshow("TOF Sensor Grid", sensor_grid)
-    cv2.imshow("Alert Log", create_alert_panel())
-    
+    dashboard = _draw_dashboard(frame, sensor_grid)
+    cv2.imshow(_DASH_WIN_NAME, dashboard)
+
     # window event handling and exit conditions
     if cv2.waitKey(1) == 27:
         break
 
 # Cleanup
 sensor_stop_event.set()
+_yolo_stop_ev.set()
+
 if sensor_thread.is_alive():
     sensor_thread.join(timeout=1.0)
+if _yolo_inf_thread.is_alive():
+    _yolo_inf_thread.join(timeout=1.0)
+if frame_buffer is not None:
+    frame_buffer.stop()
 
 if cap is not None:
     cap.release()

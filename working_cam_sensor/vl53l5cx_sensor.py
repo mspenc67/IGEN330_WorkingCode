@@ -66,8 +66,15 @@ class VL53L5CXSensor:
         for p in candidate_ports:
             for b in baud_candidates:
                 try:
-                    self.serial_conn = serial.Serial(p, b, timeout=_SERIAL_TIMEOUT)
-                    time.sleep(2)
+                    # dsrdtr=False / rtscts=False: prevent pyserial from toggling
+                    # the DTR/RTS lines on open, which would reset the ESP32 and
+                    # force a 3-5 s firmware restart before data arrives again.
+                    self.serial_conn = serial.Serial(
+                        p, b, timeout=_SERIAL_TIMEOUT,
+                        dsrdtr=False, rtscts=False,
+                    )
+                    time.sleep(0.5)                 # brief settle; no board reset needed
+                    self.serial_conn.reset_input_buffer()   # discard any partial frame
                     if self.verbose:
                         print(f"Connected to ESP32 on {p} at {b} baud")
                     return
