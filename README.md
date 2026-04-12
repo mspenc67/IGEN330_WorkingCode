@@ -136,7 +136,7 @@ python camera_and_boundingboxes_F.py
 
 ## License / course context
 
-Developed for **UBC IGEN 330** (or equivalent) assistive-technology coursework. Add a `LICENSE` file if you open-source publicly.
+Developed for **UBC IGEN 330** (or equivalent) assistive-technology coursework.
 
 ---
 
