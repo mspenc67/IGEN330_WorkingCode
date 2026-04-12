@@ -45,7 +45,7 @@ def _sanitize_speech_text(text: str) -> str:
 _TTS_PS_PREAMBLE = (
     "Add-Type -AssemblyName System.Speech; "
     "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-    "$s.Rate = 4; "
+    "$s.Rate = 2; "
     "foreach ($v in $s.GetInstalledVoices()) { "
     "  if ($v.VoiceInfo.Gender -eq "
     "[System.Speech.Synthesis.VoiceGender]::Female) { "
