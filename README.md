@@ -1,4 +1,4 @@
-# Accessibility Navigation Assistant (IGEN 330)
+# visiOnlink (IGEN 330)
 
 Real-time obstacle awareness for visually impaired navigation by fusing **RGB camera detection (YOLO)** with an **8×8 VL53L5CX time-of-flight grid** streamed from an **ESP32**. The app runs on **Windows**, speaks alerts via **Windows SAPI**, and optionally describes the scene with **Qwen2-VL**. A single **1920×1080** dashboard shows the camera, ToF heatmap, and alert log.
 
